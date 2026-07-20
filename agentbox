@@ -1,0 +1,746 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# Version — single source of truth; the installer greps ^VERSION= (keep the line bare, no trailing comment).
+VERSION=3.1.0
+# agentbox — throwaway, folder-scoped AI-agent boxes for a phone (Android Termux + proot-distro ONLY).
+#
+# THREAT MODEL: this protects YOUR FILES from *accidents* (an agent touching the wrong folder), not from a hostile
+# agent. proot is same-UID path-rewriting, not a security boundary. Each box is a proot-distro container built from a
+# profile: it binds only ONE folder (the cwd), injects only the tokens the profile lists, and can be thrown away and
+# rebuilt reproducibly. Network is shared with the phone (no VPN — use a whole-device Android VPN app for a new exit IP).
+SELF="${BASH_SOURCE[0]}"; command -v readlink >/dev/null && SELF=$(readlink -f "$SELF")
+D=$(cd "$(dirname "$SELF")" && pwd)
+# Ensure a UTF-8 locale: dw's width math counts "characters" via ${#s}, not bytes.
+case "${LC_ALL:-${LANG:-}}" in *[Uu][Tt][Ff]*) :;; *)
+  if locale -a 2>/dev/null | grep -qi '^C\.utf'; then export LC_ALL=C.UTF-8
+  elif locale -a 2>/dev/null | grep -qi 'en_US\.utf'; then export LC_ALL=en_US.UTF-8; fi;; esac
+
+# ── Settings / constants ───────────────────────────────────────────
+# XDG dirs: config/secrets in ~/.config/agentbox, runtime/state in ~/.local/state/agentbox. Overridable.
+CFG="${AGENTBOX_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/agentbox}"
+STATE="${AGENTBOX_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/agentbox}"
+# Shipped box-profile templates live next to the script ($D/templates).
+TPL="${AGENTBOX_TEMPLATES:-$D/templates}"
+# Box distro: a profile's DIST= overrides for that box > env AGENTBOX_DIST > agent.env's AGENTBOX_DIST= > debian.
+DIST="${AGENTBOX_DIST:-$(sed -n 's/^AGENTBOX_DIST=//p' "$CFG/agent.env" 2>/dev/null | head -1)}"; DIST="${DIST:-debian}"
+PDLIB="$PREFIX/var/lib/proot-distro"
+# rootfs path varies by proot-distro version: newer containers/<name>/rootfs, older installed-rootfs/<name>.
+pdroot(){ local n="${1:-$DIST}" d; for d in "$PDLIB/containers/$n/rootfs" "$PDLIB/installed-rootfs/$n"; do
+    [ -d "$d" ] && { echo "$d"; return; }; done
+  d=$(find "$PDLIB" -maxdepth 3 -type d -name "$n" 2>/dev/null | head -1)
+  [ -z "$d" ] && return 0; [ -d "$d/rootfs" ] && echo "$d/rootfs" || echo "$d"; }
+VC="$CFG"; ENVF="$VC/agent.env"   # secrets file: host-side, mode 600, values injected per-profile (never the file itself).
+GUI_BOXWEB=6902; GUI_BOXCODE=8081   # a DESKTOP= box's scoped KasmVNC + code-server ports (localhost).
+AGBASE="${AGENTBOX_BASE:-https://raw.githubusercontent.com/harryngai/agentbox/main}"   # installer base (ab update).
+RCONF="$VC/rclone.conf"; RREMOTE="${AGENTBOX_REMOTE:-dropbox}"; RFILTER="$VC/rclone-filter.txt"   # sync (rclone bisync).
+
+# ── Small helpers: output / detection ──────────────────────────────
+if [ -t 1 ] && [ -z "$NO_COLOR" ]; then G=$'\e[32m'; Y=$'\e[33m'; R=$'\e[31m'; Z=$'\e[0m'; BD=$'\e[1m'; CY=$'\e[36m'; DM=$'\e[2m'
+  else G=; Y=; R=; Z=; BD=; CY=; DM=; fi
+msg(){ printf '%s%s%s\n' "${2:-}" "$1" "$Z"; }
+has(){ command -v "$1" >/dev/null 2>&1; }
+# Display width: non-ASCII (CJK/fullwidth) counts as 2 cells — mixed CJK/ASCII alignment is computed, not hand-spaced.
+dw(){ local s="$1" w=0 i ch; for ((i=0;i<${#s};i++)); do ch=${s:i:1}
+  case "$ch" in
+    ▸|▹|·|•|→|←|↑|↓|✓|✗|⇄) w=$((w+1));;
+    [!$'\x01'-$'\x7f']) w=$((w+2));;
+    *) w=$((w+1));;
+  esac; done; echo $w; }
+kv(){ local n=$((20-$(dw "$1"))); ((n<0)) && n=0
+  printf '%s%*s: %s%s%s\n' "$1" "$n" '' "${3:-}" "$2" "$Z"; }
+short(){ local p="$1"; case "$p" in "$HOME"|"$HOME"/*) p="~${p#"$HOME"}";;
+    "${PREFIX:-//}"/*) p="\$PREFIX${p#"$PREFIX"}";; esac; printf '%s\n' "$p"; }
+# All of the phone's IPv4 addresses (LAN-like first), minus loopback — for the ssh hint printed by setup.
+lanips(){ local all
+  all=$( { ip -4 -o addr show 2>/dev/null | awk '{print $4}' | cut -d/ -f1
+           ifconfig 2>/dev/null | grep -oE 'inet (addr:)?[0-9.]+' | grep -oE '[0-9]+(\.[0-9]+){3}'
+           has termux-wifi-connectioninfo && termux-wifi-connectioninfo 2>/dev/null | sed -n 's/.*"ip"[": ]*\([0-9.]\{1,\}\).*/\1/p'
+         } | grep -vE '^127\.' | awk 'NF&&!s[$0]++' )
+  [ -n "$all" ] || return 0
+  { printf '%s\n' "$all" | grep -E '^192\.168\.'
+    printf '%s\n' "$all" | grep -E '^172\.(1[6-9]|2[0-9]|3[01])\.'
+    printf '%s\n' "$all" | grep -vE '^(192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.)'; } | awk 'NF&&!s[$0]++' | paste -sd' ' -; }
+
+# ── agent.env (tokens) ─────────────────────────────────────────────
+# Ensure the env file exists and carries the standard keys (add any it is missing). Only the keys a profile's TOKENS
+# lists are ever injected — %q-quoted into a 0600 file, sourced-then-deleted inside the box, never on argv.
+mkenv(){ mkdir -p "$VC"
+  [ -f "$ENVF" ] || printf '# agent tokens (mode 600; only the keys a profile lists in TOKENS are injected into its box)\n' > "$ENVF"
+  local k; for k in CLAUDE_CODE_OAUTH_TOKEN OPENAI_API_KEY GEMINI_API_KEY GH_TOKEN \
+      CLOUDFLARE_API_TOKEN CLOUDFLARE_ACCOUNT_ID OLLAMA_API_KEY AGENTBOX_DIST; do
+    grep -q "^$k=" "$ENVF" || printf '%s=\n' "$k" >> "$ENVF"; done
+  chmod 600 "$ENVF"; }
+# Only the listed token keys, read from agent.env and %q-quoted (sourced then deleted inside the box, never on argv).
+aboxenv(){ local keys="$1" k v; printf 'CLAUDE_CONFIG_DIR=/root/.claude\n'
+  for k in $keys; do v=$(sed -n "s/^$k=//p" "$ENVF" 2>/dev/null | head -1)
+    [ -n "$v" ] && printf '%s=%q\n' "$k" "$v"; done; }
+# Edit agent.env item by item: show the current value, Enter keeps it, typing overwrites; append new vars at the end.
+envedit(){ mkenv
+  local tty="${AGENTBOX_TTY:-/dev/tty}" tmp line k v show nv extra; tmp=$(mktemp)
+  msg "editing $ENVF (Enter = keep current value)" "$G"
+  exec 3< "$tty"
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      ''|'#'*) printf '%s\n' "$line" >> "$tmp";;
+      *=*) k="${line%%=*}"; v="${line#*=}"
+        if [ -z "$v" ]; then show="(empty)"
+        elif [ ${#v} -gt 14 ]; then show="${v:0:10}…(${#v} chars)"
+        else show="$v"; fi
+        printf '  %s [%s]: ' "$k" "$show" >&2
+        IFS= read -r nv <&3 || nv=""
+        printf '%s=%s\n' "$k" "${nv:-$v}" >> "$tmp";;
+      *) printf '%s\n' "$line" >> "$tmp";;
+    esac
+  done < "$ENVF"
+  while :; do
+    printf '  add KEY=VALUE (Enter to finish): ' >&2
+    IFS= read -r extra <&3 || extra=""
+    [ -z "$extra" ] && break
+    case "$extra" in *=*) printf '%s\n' "$extra" >> "$tmp";; *) msg "  format must be KEY=VALUE" "$Y";; esac
+  done
+  exec 3<&-
+  chmod 600 "$tmp" && mv "$tmp" "$ENVF"
+  msg "updated $ENVF" "$G"; }
+
+# ── Boxes / profiles ───────────────────────────────────────────────
+# A box is a proot-distro container built from a profile (box-<name>.conf): it installs only what INSTALL lists, binds
+# ONLY the launch folder (as /work-<kebab(cwd)>, unique per host folder so concurrent agents don't collide), and injects
+# ONLY the tokens TOKENS lists. `ab <name>` from a folder builds the box if missing and runs it there. Profiles are just
+# files: your editable copy at $VC/box-<name>.conf, seeded from $TPL/<name>.conf (or a built-in claude profile if none).
+aboxconf(){ echo "$VC/box-$1.conf"; }
+aboxalias(){ echo "agentbox-$1"; }   # every proot container / tmux session is prefixed agentbox-
+aboxtemplates(){ local f b out=; for f in "$TPL"/*.conf; do [ -e "$f" ] || break
+    b=$(basename "$f" .conf); out="$out $b"; done; echo "${out# }"; }
+# In-box bind/cd target: a unique /work-<kebab(cwd)> per host folder (only [a-z0-9-], so it is always shell-safe).
+wtarget(){ printf '/work-%s' "$(printf '%s' "${PWD#/}" | tr 'A-Z' 'a-z' | sed 's#[^a-z0-9]#-#g; s#-\{2,\}#-#g; s#-$##')"; }
+# Built-in fallback profile: baked in so the tool works with no templates dir at all (git + gh + node22 + claude-code).
+builtin_default_profile(){ cat <<'EOF'
+# agentbox box profile: default — Claude Code scoped to ONE folder (built-in fallback). YOUR copy; edit freely.
+# Simple mode: AGENT picks a built-in install recipe — no shell to write. Full control? set INSTALL='…' (docker mode).
+AGENT=claude            # claude | codex | copilot | none
+PKGS=""                 # extra apt packages to bake in (space-separated), optional
+TOKENS="CLAUDE_CODE_OAUTH_TOKEN"
+RUN="claude"
+MOUNT=cwd
+EPHEMERAL=0
+#DIST=debian            # base distro for this box (overrides the global AGENTBOX_DIST)
+#MITM=0
+EOF
+}
+# Seed a profile file: a shipped template of that name if valid, else the built-in default (kept 0600).
+aboxdefault(){ local path="$1" name="$2" src="$TPL/$name.conf"
+  if [ -f "$src" ] && [ -s "$src" ] && grep -q '^# agentbox box profile' "$src"; then ( umask 077; cp "$src" "$path" )
+  else ( umask 077; builtin_default_profile > "$path" ); fi; }
+aboxdrop(){ local a="$1" r; [ -n "$a" ] || return 0     # delete a built box (by alias); dir-remove as a fallback
+  proot-distro remove "$a" 2>/dev/null
+  r=$(pdroot "$a"); [ -z "$r" ] || rm -rf "${r%/rootfs}"; }
+# Simple mode: with no INSTALL in the conf, generate the build steps from AGENT (+ extra PKGS). Docker mode (the conf
+# sets INSTALL='…') bypasses this and runs those raw steps verbatim. Returns 3 on an unknown AGENT.
+# 'gh' in PKGS is special-cased: it adds GitHub's apt repo + a git credential helper so the box can push with GH_TOKEN.
+agent_recipe(){ local agent="${1:-none}" pkgs="${2:-}" gh=
+  case " $pkgs " in *" gh "*) gh=1; pkgs=$(printf '%s' "$pkgs" | tr ' ' '\n' | grep -vx gh | paste -sd' ' -);; esac
+  [ -n "$pkgs" ] && printf 'apt-get install -y %s\n' "$pkgs"
+  case "$agent" in
+    claude)  printf 'apt-get install -y git\ninstall-node 22\nnpm install -g @anthropic-ai/claude-code\n';;
+    codex)   printf 'apt-get install -y git\ninstall-node 22\nnpm install -g @openai/codex\n';;
+    copilot) printf 'apt-get install -y git\ninstall-node 22\nnpm install -g @github/copilot\n';;
+    none|'') :;;
+    *) return 3;;
+  esac
+  [ -n "$gh" ] && cat <<'GH'
+apt-get install -y git
+mkdir -p /etc/apt/keyrings
+curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg -o /etc/apt/keyrings/githubcli-archive-keyring.gpg
+chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" > /etc/apt/sources.list.d/github-cli.list
+apt-get update && apt-get install -y gh
+git config --system credential.https://github.com.helper '!gh auth git-credential'
+GH
+  return 0; }
+# Build the box for profile <name> from its conf: base (apt update + curl + ca-certificates + install-node helper),
+# then INSTALL (docker mode) or the AGENT/PKGS recipe (simple mode), then mitmproxy (MITM=1), then the desktop (DESKTOP).
+aboxbuild(){ local prof="$1" force="${2:-}" cf alias rootfs DIST="$DIST" \
+    INSTALL= TOKENS= RUN= MOUNT=cwd EPHEMERAL=0 DESKTOP= APP=code MITM=0 AGENT=none PKGS=
+  cf=$(aboxconf "$prof"); alias=$(aboxalias "$prof"); [ -f "$cf" ] && . "$cf"
+  [ -n "$INSTALL" ] || INSTALL=$(agent_recipe "$AGENT" "$PKGS") \
+    || { msg "profile '$prof': unknown AGENT '$AGENT' (use claude|codex|copilot|none)" "$R"; return 1; }
+  { [ "$force" = force ] && [ -n "$(pdroot "$alias")" ]; } && { aboxguard "$prof"; aboxdrop "$alias"; }
+  if [ -z "$(pdroot "$alias")" ]; then
+    msg "building box '$prof' — $DIST (first build downloads a few hundred MB)…" "$G"
+    proot-distro install "$DIST" --override-alias "$alias" \
+      || { msg "install failed — update proot-distro: pkg upgrade proot-distro" "$R"; return 1; }
+  fi
+  rootfs=$(pdroot "$alias"); [ -n "$rootfs" ] || { msg "box '$prof' rootfs not found" "$R"; return 1; }
+  [ -n "$DESKTOP" ] && { msg "  DESKTOP → installing the desktop stack (minimal xfce + KasmVNC + chromium$([ "$APP" = code ] && echo ' + code-server'); heavy)…" "$Y"
+    guiinstallscript "$rootfs/root/.gui-install.sh"; }
+  { printf '#!/bin/bash\nset -e\nexport DEBIAN_FRONTEND=noninteractive\napt-get update\napt-get install -y curl ca-certificates\n'
+    printf 'install-node(){ command -v node >/dev/null 2>&1 && return 0; curl -fsSL "https://deb.nodesource.com/setup_${1:-22}.x" | bash - ; apt-get install -y nodejs; }\n'
+    [ -n "$INSTALL" ] && printf '%s\n' "$INSTALL"
+    [ "$MITM" = 1 ] && printf 'apt-get install -y mitmproxy%s || { apt-get install -y python3-pip python3-venv libnss3-tools && pip3 install --break-system-packages mitmproxy; }\n' "$([ -n "$DESKTOP" ] && printf ' libnss3-tools')"
+    [ -n "$DESKTOP" ] && printf 'bash /root/.gui-install.sh %s %s\n' "${AGENTBOX_KASMVNC_VER:-1.4.0}" "$APP"
+  } > "$rootfs/root/.abbuild.sh"
+  mkdir -p "$rootfs/root/.claude"
+  [ -f "$rootfs/root/.claude/.claude.json" ] || printf '{"hasCompletedOnboarding": true}\n' > "$rootfs/root/.claude/.claude.json"
+  if proot-distro login "$alias" -- bash /root/.abbuild.sh; then rm -f "$rootfs/root/.abbuild.sh" "$rootfs/root/.gui-install.sh"; msg "box '$prof' ready" "$G"
+  else rm -f "$rootfs/root/.abbuild.sh" "$rootfs/root/.gui-install.sh"; msg "build failed for '$prof' (see output above)" "$R"; return 1; fi; }
+# Stop the running box desktop (session agentbox-boxgui); a throwaway (EPHEMERAL=1) desktop box is deleted on stop so
+# its next launch is genuinely fresh (this is where EPHEMERAL is honoured for desktop boxes).
+aboxguistop(){ local prof; prof=$(cat "$STATE/boxgui.prof" 2>/dev/null)
+  tmux kill-session -t "=agentbox-boxgui" 2>/dev/null; rm -f "$STATE/boxgui.prof"
+  if [ -n "$prof" ]; then local cf INSTALL TOKENS RUN MOUNT EPHEMERAL=0 DESKTOP APP MITM AGENT PKGS DIST
+    cf=$(aboxconf "$prof"); [ -f "$cf" ] && . "$cf"
+    [ "$EPHEMERAL" = 1 ] && aboxdrop "$(aboxalias "$prof")" && msg "throwaway box '$prof' deleted — next launch is fresh" "$Y"; fi
+  anysession || { [ "$(wakestat)" = on ] && wakeoff; }; return 0; }
+# If <prof>'s desktop is the one currently running, stop it before we delete/rebuild its rootfs (proot is userspace —
+# rm -rf under a live session would corrupt it and orphan the session + wakelock).
+aboxguard(){ [ -f "$STATE/boxgui.prof" ] && [ "$(cat "$STATE/boxgui.prof" 2>/dev/null)" = "$1" ] \
+    && tmux has-session -t "=agentbox-boxgui" 2>/dev/null \
+    && { msg "stopping box '$1's running desktop first…" "$Y"; aboxguistop; }; return 0; }
+# Scoped desktop for a DESKTOP=xfce box: KasmVNC + (code-server for APP=code, or chromium for APP=browser) inside the
+# box. Own ports (6902/8081, localhost); one box desktop at a time (session agentbox-boxgui). Fresh random password each
+# start, printed. MOUNT=none binds nothing (SEALED); otherwise the cwd opens as /work-<cwd>. MITM=1 routes chromium
+# through mitmweb (CA trusted into the box's nssdb, proxy flag added).
+aboxgui(){ local prof="$1" alias="$2" rootfs="$3" app="${4:-code}" mnt="${5:-cwd}" mitm="${6:-0}" pw tgt geo
+  needtmux || return 1
+  { [ -x "$rootfs/usr/bin/startxfce4" ] && [ -d "$rootfs/usr/share/kasmvnc" ]; } \
+    || { msg "the desktop stack isn't in box '$prof' yet — rebuild it: ab remove $prof && ab $prof" "$Y"; return 1; }
+  tmux has-session -t "=agentbox-boxgui" 2>/dev/null \
+    && { msg "a box desktop is already running (one at a time) — stop it: ab remove $prof" "$Y"; return 1; }
+  pw=$(gui_randpw)
+  mkdir -p "$rootfs/root/.vnc" "$rootfs/root/.config/code-server"
+  # blacklist_threshold=100: every client arrives as 127.0.0.1 and each page-load counts as a failed attempt — the
+  # default threshold of 5 would blacklist the owner within a few loads.
+  printf 'network:\n  interface: 127.0.0.1\n  websocket_port: %s\n  ssl:\n    require_ssl: false\nsecurity:\n  brute_force_protection:\n    blacklist_threshold: 100\n    blacklist_timeout: 10\n' "$GUI_BOXWEB" > "$rootfs/root/.vnc/kasmvnc.yaml"
+  printf '#!/bin/sh\nxset s off -dpms s noblank 2>/dev/null\nxsetroot -solid "#000000" 2>/dev/null\nexec xfce4-session\n' > "$rootfs/root/.vnc/xstartup"
+  chmod +x "$rootfs/root/.vnc/xstartup"; : > "$rootfs/root/.vnc/.de-was-selected"
+  # config.yaml (0600) is the ONLY secret file: it holds the shared password. The run script reads it from there so no
+  # secret rides on argv. Geometry is expanded HOST-side (AGENTBOX_* is stripped from the box env).
+  ( umask 077; { echo "bind-addr: 127.0.0.1:$GUI_BOXCODE"; echo "auth: password"; echo "password: $pw"; echo "cert: false"; } > "$rootfs/root/.config/code-server/config.yaml" )
+  geo="${AGENTBOX_GUI_GEOMETRY:-1440x900}"; tgt=$(wtarget); [ "$mnt" = none ] && tgt=/root
+  { cat <<EOS
+#!/bin/bash
+export HOME=/root
+PW=\$(sed -n 's/^password: //p' /root/.config/code-server/config.yaml 2>/dev/null | head -1)
+[ -n "\$PW" ] && printf '%s\n%s\n' "\$PW" "\$PW" | timeout 15 vncpasswd -u agent -w -o >/dev/null 2>&1 || true
+export XDG_RUNTIME_DIR="/tmp/runtime-\$(id -u)"; mkdir -p "\$XDG_RUNTIME_DIR"; chmod 700 "\$XDG_RUNTIME_DIR"
+vncserver -kill :1 >/dev/null 2>&1 || true
+rm -f /tmp/.X1-lock /tmp/.X11-unix/X1
+vncserver :1 -geometry "$geo" -depth 24 -noreset || exit 1
+EOS
+    [ "$mitm" = 1 ] && cat <<'EOS'
+mitmweb --mode regular --listen-host 127.0.0.1 --listen-port 8082 --web-host 127.0.0.1 --web-port 8083 --set web_open_browser=false >/tmp/mitmweb.log 2>&1 &
+for i in $(seq 1 15); do [ -f "$HOME/.mitmproxy/mitmproxy-ca-cert.pem" ] && break; sleep 1; done
+if [ -f "$HOME/.mitmproxy/mitmproxy-ca-cert.pem" ]; then
+  mkdir -p "$HOME/.pki/nssdb"
+  certutil -d sql:"$HOME/.pki/nssdb" -L >/dev/null 2>&1 || certutil -d sql:"$HOME/.pki/nssdb" -N --empty-password
+  certutil -d sql:"$HOME/.pki/nssdb" -A -t "C,," -n mitmproxy -i "$HOME/.mitmproxy/mitmproxy-ca-cert.pem" 2>/dev/null
+  cp "$HOME/.mitmproxy/mitmproxy-ca-cert.pem" /usr/local/share/ca-certificates/mitmproxy.crt 2>/dev/null && update-ca-certificates >/dev/null 2>&1 || true
+  mkdir -p /etc/chromium.d
+  printf 'export CHROMIUM_FLAGS="$CHROMIUM_FLAGS --proxy-server=127.0.0.1:8082 --proxy-bypass-list=localhost,127.0.0.1"\n' > /etc/chromium.d/agentbox-mitm
+fi
+EOS
+    if [ "$app" = browser ]; then cat <<'EOS'
+export DISPLAY=:1
+CH=$(command -v chromium chromium-browser 2>/dev/null | head -1)
+[ -n "$CH" ] && "$CH" --start-maximized about:blank >/dev/null 2>&1 &
+exec sleep infinity
+EOS
+    else printf 'exec code-server --bind-addr 127.0.0.1:%s %s\n' "$GUI_BOXCODE" "$tgt"; fi
+  } > "$rootfs/root/.boxgui-run.sh"
+  chmod +x "$rootfs/root/.boxgui-run.sh"
+  [ "$(wakestat)" = on ] || wakeon || true
+  # Launch via bash -c '…"$2"…' _ "$alias" "$PWD" "$tgt": the host path arrives as argv, expanded once, so any
+  # space/$/quote/backtick in it stays literal (no re-parsed launch-script path).
+  if [ "$mnt" = none ]; then
+    tmux new -ds agentbox-boxgui bash -c 'exec proot-distro login "$1" --isolated -- bash /root/.boxgui-run.sh' _ "$alias"
+  else
+    tmux new -ds agentbox-boxgui bash -c 'exec proot-distro login "$1" --isolated --bind "$2:$3" -- bash /root/.boxgui-run.sh' _ "$alias" "$PWD" "$tgt"
+  fi
+  sleep 3
+  tmux has-session -t "=agentbox-boxgui" 2>/dev/null \
+    || { msg "box desktop exited immediately — rebuild the box: ab remove $prof && ab $prof" "$R"; return 1; }
+  mkdir -p "$STATE"; printf '%s' "$prof" > "$STATE/boxgui.prof"
+  [ "$mnt" = none ] && msg "box desktop '$prof' started — SEALED (no folder bound):" "$G" \
+    || msg "box desktop '$prof' started — scoped to $(short "$PWD") (opens as $tgt):" "$G"
+  kv "  desktop (KasmVNC)" "http://localhost:$GUI_BOXWEB  (login user: agent)" "$G"
+  [ "$app" = browser ] && kv "  browser" "chromium (opens in the desktop; reopen from the menu if closed)" "$G" \
+    || kv "  VS Code" "http://localhost:$GUI_BOXCODE" "$G"
+  [ "$mitm" = 1 ] && kv "  mitmweb UI" "http://localhost:8083 (open in the box browser)" "$Y"
+  kv "  password (both)" "$pw" "$G"
+  msg "  stop / drop the box: ab remove $prof" "$Y"; return 0; }
+# `ab <name> [cmd]` — build box <name> from its profile if missing, then run it scoped to the cwd.
+abox(){ local prof="$1"; shift; local cmd="$*" cf alias rootfs \
+    INSTALL= TOKENS= RUN= MOUNT=cwd EPHEMERAL=0 DESKTOP= APP=code MITM=0 AGENT= PKGS= DIST= ef efn rc tgt run incmd mitmblock= ms=
+  cf=$(aboxconf "$prof"); alias=$(aboxalias "$prof")
+  has proot-distro || pkg install -y proot-distro || { msg "proot-distro install failed" "$R"; return 1; }
+  [ -f "$cf" ] || { mkdir -p "$VC"; aboxdefault "$cf" "$prof" || return 1
+    msg "new profile $(short "$cf") — binds only the launch folder, injects only its tokens (edit it directly)" "$Y"; }
+  . "$cf"; mkenv
+  # Auto-session: an interactive, command-less CLI box runs inside a per-folder tmux session (survives ssh-drop; two
+  # folders → two sessions). Explicit cmd / piped output / already in tmux / desktop box → foreground. Off: AB_NO_SESSION=1.
+  if [ -z "$DESKTOP" ] && [ -z "$cmd" ] && [ -t 1 ] && [ -z "${TMUX:-}" ] && [ "${AB_NO_SESSION:-}" != 1 ]; then
+    sessrun "$prof"; return $?
+  fi
+  # Build when missing; a non-desktop EPHEMERAL box rebuilds fresh each run (desktop boxes only when missing — too heavy).
+  if { [ -z "$DESKTOP" ] && [ "$EPHEMERAL" = 1 ]; } || [ -z "$(pdroot "$alias")" ]; then
+    { [ -z "$DESKTOP" ] && [ "$EPHEMERAL" = 1 ] && [ -n "$(pdroot "$alias")" ]; } && { aboxguard "$prof"; aboxdrop "$alias"; }
+    aboxbuild "$prof" || return 1
+  fi
+  rootfs=$(pdroot "$alias"); [ -n "$rootfs" ] || { msg "box '$prof' not built" "$R"; return 1; }
+  # DESKTOP set → run a scoped desktop (background); nothing after this runs for a GUI box.
+  [ -n "$DESKTOP" ] && { aboxgui "$prof" "$alias" "$rootfs" "$APP" "$MOUNT" "$MITM"; return $?; }
+  run="${cmd:-$RUN}"; [ "$MITM" = 1 ] && ms='; mitm on'
+  ef="$rootfs/root/.abenv.$$"; efn=".abenv.$$"     # token file lives inside the isolated rootfs; nothing else is bound
+  ( umask 077; aboxenv "$TOKENS" > "$ef" )
+  if [ "$MITM" = 1 ]; then mitmblock='mitmweb --mode regular --listen-host 127.0.0.1 --listen-port 8082 --web-host 127.0.0.1 --web-port 8083 --set web_open_browser=false >/tmp/mitmweb.log 2>&1 &
+for i in $(seq 1 15); do [ -f "$HOME/.mitmproxy/mitmproxy-ca-cert.pem" ] && break; sleep 1; done
+[ -f "$HOME/.mitmproxy/mitmproxy-ca-cert.pem" ] && { cp "$HOME/.mitmproxy/mitmproxy-ca-cert.pem" /usr/local/share/ca-certificates/mitmproxy.crt 2>/dev/null && update-ca-certificates >/dev/null 2>&1; } || true
+export NODE_EXTRA_CA_CERTS=$HOME/.mitmproxy/mitmproxy-ca-cert.pem HTTP_PROXY=http://127.0.0.1:8082 HTTPS_PROXY=http://127.0.0.1:8082
+'; fi
+  # source+delete the token file, run the (optional) mitm setup, then exec RUN in the working dir; $1 = in-box start dir.
+  incmd='set -a; . /root/'"$efn"' 2>/dev/null; rm -f /root/'"$efn"'; set +a; export HOME=/root; cd "$1"; '"$mitmblock"'exec '"${run:-bash}"
+  if [ "${MOUNT:-cwd}" = none ]; then
+    msg "box '$prof' — SEALED (no folder bound); tokens: ${TOKENS:-none}; running: ${run:-bash}$ms" "$G"
+    proot-distro login "$alias" --isolated -- bash -c "$incmd" _ /root
+  else
+    tgt=$(wtarget)
+    case "$PWD/" in "$HOME"/) msg "note: launched from your home — the box would see all of it; cd into a project folder for tight scoping" "$Y";; esac
+    msg "box '$prof' — sees ONLY $(short "$PWD") (as $tgt); tokens: ${TOKENS:-none}; running: ${run:-bash}$ms" "$G"
+    proot-distro login "$alias" --isolated --bind "$PWD:$tgt" -- bash -c "$incmd" _ "$tgt"
+  fi
+  rc=$?; rm -f "$ef" 2>/dev/null
+  [ "$EPHEMERAL" = 1 ] && [ -z "$DESKTOP" ] && { aboxdrop "$alias"; msg "ephemeral box '$prof' removed (rebuilds next launch)" "$G"; }
+  return $rc; }
+# `ab` / `ab ls` — every box (built or profile-only) + templates + snapshots, one picture.
+boxls(){ local f prof n=0 sn=0 tpl
+  for f in "$VC"/box-*.conf; do [ -e "$f" ] || break
+    prof=$(basename "$f" .conf); prof=${prof#box-}; n=$((n+1))
+    [ -n "$(pdroot "$(aboxalias "$prof")")" ] && kv "$prof" "built · ab $prof" "$G" \
+      || kv "$prof" "profile · ab $prof builds it" "$Y"
+  done
+  [ "$n" -eq 0 ] && msg "no boxes yet — ab claude scopes an agent to this folder" "$Y"
+  tpl=$(aboxtemplates); [ -n "$tpl" ] && kv "templates" "$tpl · ab <name> to create" "$DM"
+  for f in "$STATE"/box-snapshot-*.tar.gz; do [ -e "$f" ] || break
+    prof=$(basename "$f" .tar.gz); prof=${prof#box-snapshot-}
+    kv "snapshot $prof" "$(du -h "$f" | cut -f1) · $(date -r "$f" '+%Y-%m-%d %H:%M')" "$G"; sn=$((sn+1)); done
+  [ "$sn" -eq 0 ] && kv "snapshots" "none · ab save <name>" "$DM"; return 0; }
+# `ab remove <name>` — stop its desktop if running, delete rootfs + snapshot; KEEP the profile conf.
+boxremove(){ local prof="${1:-}" a snap; [ -n "$prof" ] || { msg "which box? ab remove <name>" "$Y"; return 1; }
+  aboxguard "$prof"; a=$(aboxalias "$prof"); snap="$STATE/box-snapshot-$prof.tar.gz"
+  [ -n "$(pdroot "$a")" ] && { aboxdrop "$a"; msg "box '$prof' rootfs removed" "$G"; } || msg "no built box for '$prof'" "$Y"
+  [ -f "$snap" ] && { rm -f "$snap"; msg "snapshot for '$prof' deleted" "$G"; }
+  msg "profile $(short "$(aboxconf "$prof")") kept" "$Y"; return 0; }
+
+# ── Package helper (simple-mode profiles) ──────────────────────────
+# `ab pkg <name> search <term>` lists matches from the built box's apt catalog; `add`/`rm <pkg…>` edit the profile's
+# PKGS= line (rebuild to apply); bare/ls prints it. Docker-mode profiles (INSTALL set) ignore PKGS — a note is shown.
+abpkg(){ local prof="${1:-}" verb cf a cur new p tmp; [ $# -gt 0 ] && shift; verb="${1:-ls}"; [ $# -gt 0 ] && shift
+  cf=$(aboxconf "$prof"); a=$(aboxalias "$prof")
+  [ -n "$prof" ] || { msg "usage: ab pkg <name> [ls | add <pkg…> | rm <pkg…> | search <term>]" "$Y"; return 1; }
+  case "$verb" in
+    search) [ -n "${1:-}" ] || { msg "usage: ab pkg $prof search <term>" "$Y"; return 1; }
+      [ -n "$(pdroot "$a")" ] || { msg "build '$prof' first (ab $prof) — search reads its apt catalog" "$Y"; return 1; }
+      proot-distro login "$a" -- sh -c 'apt-cache search -- "$1" 2>/dev/null | sort | head -40' _ "$1";;
+    add|rm) [ -n "${1:-}" ] || { msg "usage: ab pkg $prof $verb <pkg…>" "$Y"; return 1; }
+      [ -f "$cf" ] || { msg "no profile '$prof' yet — create it: ab $prof" "$Y"; return 1; }
+      [ -n "$( . "$cf" 2>/dev/null; printf %s "$INSTALL" )" ] && msg "note: '$prof' is docker mode (INSTALL set) — PKGS is ignored" "$Y"
+      cur=$( . "$cf" 2>/dev/null; printf %s "$PKGS" )
+      if [ "$verb" = add ]; then new="$cur $*"; else new=" $cur "; for p in "$@"; do new="${new//" $p "/ }"; done; fi
+      new=$(printf %s "$new" | tr ' ' '\n' | awk 'NF&&!s[$0]++' | paste -sd' ' -)
+      if grep -q '^PKGS=' "$cf"; then tmp=$(mktemp); sed "s|^PKGS=.*|PKGS=\"$new\"|" "$cf" > "$tmp" && mv "$tmp" "$cf"
+      else printf 'PKGS="%s"\n' "$new" >> "$cf"; fi
+      msg "PKGS = ${new:-(empty)} · rebuild to apply: ab remove $prof && ab $prof" "$G";;
+    ls|"") [ -f "$cf" ] || { msg "no profile '$prof' yet" "$Y"; return 1; }
+      kv "$prof PKGS" "$( . "$cf" 2>/dev/null; printf %s "${PKGS:-(none)}")";;
+    *) msg "usage: ab pkg <name> [ls | add <pkg…> | rm <pkg…> | search <term>]" "$Y"; return 1;;
+  esac; }
+
+# ── Snapshot / golden image ────────────────────────────────────────
+# Golden image of a box rootfs (SYSTEM state only — your folders live outside and are untouched). Stored host-side in
+# $STATE. Restore = factory reset in minutes, nothing re-downloaded.
+boxbusy(){ local r="${1:-}"; [ -n "$r" ] && pgrep -f "$r" >/dev/null 2>&1; }   # empty r → not busy (never match-all)
+boxsave(){ snapshot "${1:-}" make; }
+boxrestore(){ snapshot "${1:-}" restore; }
+snapshot(){ local prof="${1:-}" verb="${2:-status}" rootfs snapfile par base a
+  [ -n "$prof" ] || { msg "which box? ab save <name> | ab restore <name>" "$Y"; return 1; }
+  rootfs=$(pdroot "$(aboxalias "$prof")"); snapfile="$STATE/box-snapshot-$prof.tar.gz"
+  case "$verb" in
+    make|save)
+      { [ -n "$rootfs" ] && [ -d "$rootfs" ]; } || { msg "no '$prof' box yet (ab $prof)" "$Y"; return 1; }
+      boxbusy "$rootfs" && { msg "'$prof' box processes are running — stop them first (ab session kill)" "$Y"; return 1; }
+      par=$(dirname "$rootfs"); base=$(basename "$rootfs"); mkdir -p "$STATE"
+      msg "snapshotting '$prof' → $(short "$snapfile") (a few minutes on phone flash)…" "$G"
+      ( umask 077; tar -czf "$snapfile.tmp" -C "$par" "$base" ) \
+        || { rm -f "$snapfile.tmp"; msg "snapshot failed (see tar errors above)" "$R"; return 1; }
+      chmod 600 "$snapfile.tmp" 2>/dev/null; mv -f "$snapfile.tmp" "$snapfile"
+      msg "snapshot done: $(short "$snapfile") ($(du -h "$snapfile" | cut -f1)) — restore any time: ab restore $prof" "$G";;
+    restore)
+      [ -s "$snapfile" ] || { msg "no '$prof' snapshot yet — make one first: ab save $prof" "$Y"; return 1; }
+      [ -n "$rootfs" ] || { msg "no '$prof' box to restore into — build it first: ab $prof" "$Y"; return 1; }
+      boxbusy "$rootfs" && { msg "'$prof' box processes are running — stop them first (ab session kill)" "$Y"; return 1; }
+      aboxguard "$prof"; par=$(dirname "$rootfs"); base=$(basename "$rootfs")
+      # The archive's top-level dir must match the current rootfs basename, or extraction would land beside the (deleted)
+      # rootfs and leave the box gone — verify BEFORE the destructive rm, so a mismatch aborts cleanly.
+      case "$(tar -tzf "$snapfile" 2>/dev/null | head -1)" in
+        "$base"/*|"$base") : ;;
+        *) msg "snapshot layout doesn't match this box's rootfs dir ('$base') — remake it: ab save $prof" "$R"; return 1;; esac
+      msg "this REPLACES the '$prof' box system with the snapshot from $(date -r "$snapfile" '+%Y-%m-%d %H:%M')" "$Y"
+      printf 'restore? [y/N] '; read -r a
+      case "$a" in [Yy]*) :;; *) msg "cancelled" "$Y"; return 1;; esac
+      msg "restoring (a few minutes)…" "$G"
+      rm -rf "$rootfs" && tar -xzf "$snapfile" -C "$par" \
+        || { msg "restore FAILED midway — the box may be broken; re-run restore, or rebuild it (ab remove $prof && ab $prof)" "$R"; return 1; }
+      msg "'$prof' box restored to the snapshot state" "$G";;
+    ""|status) if [ -s "$snapfile" ]; then
+        msg "snapshot ($prof): $(short "$snapfile") ($(du -h "$snapfile" | cut -f1), made $(date -r "$snapfile" '+%Y-%m-%d %H:%M')) — ab restore $prof" "$G"
+      else msg "no '$prof' snapshot — after a good build: ab save $prof (= a factory-reset point)" "$Y"; fi;;
+    *) msg "use: ab save <name> | ab restore <name>" "$Y"; return 1;; esac; }
+
+# ── Desktop install script (shared by aboxbuild for DESKTOP=xfce boxes) ──
+gui_randpw(){ head -c 24 /dev/urandom | base64 2>/dev/null | tr -dc 'a-zA-Z0-9' | cut -c1-16; }   # bounded, can't hang
+# Emit the desktop-stack install script (xfce + chromium + KasmVNC + code-server) to $1. In-box args: KVER APP.
+guiinstallscript(){ cat > "$1" <<'EOS'
+#!/bin/bash
+set -e
+export DEBIAN_FRONTEND=noninteractive
+KVER="${1:-1.4.0}"   # passed host-side (AGENTBOX_* is filtered out of the box env, so it can't be read here)
+APP="${2:-code}"     # code = install code-server (VS Code) | browser = chromium only, skip code-server
+apt-get update
+# drop the old TigerVNC/noVNC stack if a previous install left it (KasmVNC replaces it)
+apt-get purge -y tigervnc-standalone-server tigervnc-common novnc websockify >/dev/null 2>&1 || true
+# minimal xfce: session + window manager only — no panel/desktop/thunar/goodies (black root set in xstartup)
+apt-get install -y --no-install-recommends \
+  xfce4-session xfwm4 dbus-x11 x11-xserver-utils fonts-dejavu-core fonts-noto-cjk fonts-noto-color-emoji \
+  curl ca-certificates
+# chromium: package name differs by distro (debian: chromium, ubuntu: chromium-browser)
+apt-get install -y chromium 2>/dev/null || apt-get install -y chromium-browser || true
+# chromium under proot has no sandbox namespaces and a tiny /dev/shm → bake safe flags for every launch
+mkdir -p /etc/chromium.d
+printf 'export CHROMIUM_FLAGS="$CHROMIUM_FLAGS --no-sandbox --disable-gpu --disable-dev-shm-usage"\n' > /etc/chromium.d/agentbox
+# KasmVNC: modern VNC with a built-in web client. Pick the .deb matching this distro codename + arch; fall back to bookworm.
+. /etc/os-release; CN="${VERSION_CODENAME:-bookworm}"
+case "$CN" in trixie|bookworm|bullseye|focal|jammy|noble|kali-rolling) : ;; *) CN=bookworm ;; esac
+ARCH=$(dpkg --print-architecture)
+DEB="kasmvncserver_${CN}_${KVER}_${ARCH}.deb"
+if [ ! -d /usr/share/kasmvnc ]; then
+  curl -fsSL -o "/tmp/$DEB" "https://github.com/kasmtech/KasmVNC/releases/download/v${KVER}/$DEB"
+  apt-get install -y "/tmp/$DEB"; rm -f "/tmp/$DEB"
+fi
+# code-server (browser VS Code) — only for APP=code. The password is set later by aboxgui, not here.
+if [ "$APP" = code ]; then command -v code-server >/dev/null 2>&1 || curl -fsSL https://code-server.dev/install.sh | sh; fi
+echo "----------------------------------------"
+echo "desktop  : xfce $([ -x /usr/bin/startxfce4 ] && echo ok || echo MISSING)"
+echo "kasmvnc  : $([ -d /usr/share/kasmvnc ] && echo "ok (v$KVER, $CN/$ARCH)" || echo MISSING)"
+echo "chromium : $(command -v chromium chromium-browser 2>/dev/null | head -1 || echo MISSING)"
+echo "code-srv : $([ "$APP" = code ] && { code-server --version 2>/dev/null | head -1 || echo unknown; } || echo 'skipped (browser-only)')"
+[ -d /usr/share/kasmvnc ] || { echo "ERROR: KasmVNC did not install" >&2; exit 1; }
+[ -x /usr/bin/startxfce4 ] || { echo "ERROR: xfce did not install" >&2; exit 1; }
+EOS
+}
+
+# ── Sessions (host tmux) + anti-sleep wakelock ─────────────────────
+# Anti-sleep: termux-wake-lock keeps computing with the screen off / app switched. Auto-acquired when a session opens,
+# auto-released when the last one ends. Marker: $STATE/wake.on.
+wakeon(){ has termux-wake-lock || { msg "termux-wake-lock not found (ships with termux-tools)" "$R"; return 1; }
+  termux-wake-lock && mkdir -p "$STATE" && : > "$STATE/wake.on" \
+    && msg "wakelock acquired — keeps computing with the screen off (drains battery; released when all sessions end)" "$G"; }
+wakeoff(){ termux-wake-unlock 2>/dev/null; rm -f "$STATE/wake.on"; msg "wakelock released — device returns to normal sleep" "$G"; }
+wakestat(){ [ -f "$STATE/wake.on" ] && echo on || echo off; }
+# ~/.tmux.conf tuned for TUI agents: mouse OFF (tmux mouse mode hijacks scroll/selection and breaks TUI input + copy),
+# plus passthrough + extended keys so escapes / Shift+Enter reach the app. Idempotent managed block; backs up once.
+tmuxconf(){ local f=~/.tmux.conf force="${1:-}"
+  if grep -q '#AGENTBOX-TMUX v2' "$f" 2>/dev/null && [ "$force" != force ]; then return 0; fi
+  [ -f "$f" ] && [ ! -f "$f.bak" ] && cp "$f" "$f.bak"
+  [ -f "$f" ] && sed -i -e '/^#AGENTBOX-TMUX v2/,/^#AGENTBOX-TMUX-END/d' "$f" 2>/dev/null
+  { printf '#AGENTBOX-TMUX v2 (managed) — terminal behaviour for TUI agents (mouse off = scroll/select/copy-paste work)\n'
+    printf 'set -g mouse off\n'
+    printf 'set -gq allow-passthrough on\n'
+    printf 'set -sq extended-keys on\n'
+    printf "set -asq terminal-features 'xterm*:extkeys'\n"
+    printf '#AGENTBOX-TMUX-END\n'; } >> "$f"
+  tmux info >/dev/null 2>&1 && tmux source-file "$f" 2>/dev/null
+  [ "$force" != force ] || msg "tmux config applied → $f (mouse off, passthrough, extended keys; first run backs up to $f.bak)" "$G"
+  return 0; }
+needtmux(){ has tmux || pkg install -y tmux || { msg "tmux is required but not available" "$R"; return 1; }; tmuxconf; }
+anysession(){ tmux ls -F '#S' 2>/dev/null | grep -q '^agentbox-'; }
+# A session pane re-runs `bash "$SELF" …`; if the on-disk script won't parse, the pane dies the instant it starts —
+# after we've grabbed the wakelock. Check first: fail loud, print the real parser message, don't touch the lock.
+selfok(){ local e; e=$(bash -n "$SELF" 2>&1) && return 0
+  msg "agentbox won't parse — not opening a session (fix the syntax error, or reinstall):" "$R"
+  printf '%s\n' "$e" | while IFS= read -r l; do msg "  $l" "$Y"; done; return 1; }
+# List/pick agentbox tmux sessions to reattach (mode=enter) or kill (mode=kill).
+sesspick(){ local mode="${1:-enter}" names=() n path i=1 c
+  while IFS=$'\t' read -r n path; do [ -n "$n" ] || continue; names+=("$n")
+      printf '  %s) %s%s\n' "$i" "${n#agentbox-}" "${path:+  $(short "$path")}"; i=$((i+1)); done \
+    < <(tmux ls -F "#S"$'\t'"#{pane_current_path}" 2>/dev/null | grep '^agentbox-')
+  [ ${#names[@]} -eq 0 ] && { msg "no agentbox sessions — open one: ab session <name>" "$Y"; return 0; }
+  printf '%s which? [1-%s, q=cancel] ' "$([ "$mode" = kill ] && echo kill || echo reattach)" "${#names[@]}"; read -r c
+  case "$c" in ''|q|Q) return 0;; *[!0-9]*) msg "enter a number" "$R"; return 1;; esac
+  { [ "$c" -ge 1 ] && [ "$c" -le ${#names[@]} ]; } || { msg "out of range" "$R"; return 1; }
+  n="${names[$((c-1))]}"
+  if [ "$mode" = kill ]; then tmux kill-session -t "=$n" 2>/dev/null; msg "session '${n#agentbox-}' killed" "$G"
+  else needtmux || return 1; tmux attach -t "=$n"; fi
+  anysession || { [ "$(wakestat)" = on ] && wakeoff; }; return 0; }
+# A per-folder session tag so two folders running the same box get two sessions (re-attach stays deterministic).
+sesstag(){ printf '%s' "$PWD" | cksum | cut -d' ' -f1; }
+# Open/reattach a persistent session (agentbox-<name>-<folder>) running box <name> here (survives ssh drop / app switch).
+sessrun(){ local prof="$1"; shift; local s; s="$(aboxalias "$prof")-$(sesstag)"
+  needtmux || return 1; selfok || return 1
+  [ "$(wakestat)" = on ] || wakeon || true
+  tmux new -As "$s" -c "$PWD" bash "$SELF" "$prof" "$@"
+  anysession || { [ "$(wakestat)" = on ] && wakeoff; }; return 0; }
+session(){ local k n; case "${1:-}" in
+    ""|ls|list) sesspick;;
+    kill) shift
+      if [ -n "${1:-}" ]; then n=0
+        for k in $(tmux ls -F '#S' 2>/dev/null | grep -E "^agentbox-$1(-|\$)"); do
+          tmux kill-session -t "=$k" 2>/dev/null && n=$((n+1)); done
+        [ "$n" -gt 0 ] && msg "killed $n session(s) for '$1'" "$G" || msg "no session for '$1'" "$Y"
+        anysession || { [ "$(wakestat)" = on ] && wakeoff; }
+      else sesspick kill; fi;;
+    *) sessrun "$@";; esac; }
+
+# ── rclone two-way sync (cwd ⇄ Dropbox) ────────────────────────────
+# Under proot/Termux inotify is unreliable → rclone bisync, triggered manually (or a simple watch loop). rclone.conf
+# holds the Dropbox token (secret) → kept in $VC, never in the box. Needs rclone >=1.64.
+rc(){ rclone --config "$RCONF" "$@"; }
+rcsetup(){ has rclone || pkg install -y rclone || return 1
+  msg "name the remote '$RREMOTE'; if the phone can't open a browser, run 'rclone authorize dropbox' on a computer and paste the token back" "$Y"
+  rc config; }
+rcpair(){ printf '%s..%s' "$(printf '%s' "${PWD#/}" | tr '/ ' '__')" "$(printf '%s' "$RREMOTE:$1" | tr ':/ ' '___')"; }
+rcok(){ [ -z "${AB_RC_YES:-}" ] || return 0   # confirm once per run before syncing this dir (a mistake would sync the whole tree)
+  local a; printf 'sync %s ⇄ %s? [y/N] ' "$PWD" "$RREMOTE"; read -r a
+  case "$a" in [Yy]*) AB_RC_YES=1; return 0;; *) return 1;; esac; }
+rcsync(){ local p="${1:-}" mark
+  [ -n "$p" ] || { msg "usage: ab sync <Dropbox path> [resync] | watch | setup | remove <path> | status" "$R"; return 1; }
+  has rclone || rcsetup || return 1
+  rc listremotes 2>/dev/null | grep -q "^$RREMOTE:" || { msg "'$RREMOTE:' remote not configured — run 'ab sync setup' first" "$R"; return 1; }
+  p="${p#"$HOME"/}"; p="${p#/}"   # a ~/… path expands to $HOME/… in the shell → always treat as a Dropbox path
+  [ -n "$p" ] || { msg "Dropbox path cannot be the root" "$R"; return 1; }
+  rcok || return 1
+  [ -f "$RFILTER" ] || printf -- '- node_modules/**\n- .venv/**\n- __pycache__/**\n- .DS_Store\n' > "$RFILTER"
+  mark="$STATE/bisync/$(rcpair "$p").ok"; mkdir -p "$STATE/bisync"
+  local flags=(--config "$RCONF" --filters-file "$RFILTER" --conflict-resolve newer \
+    --resilient --recover --max-lock 2m --workdir "$STATE/bisync" -v)
+  if [ ! -f "$mark" ] || [ "${2:-}" = resync ] || [ "${2:-}" = --resync ]; then flags+=(--resync); fi
+  rc mkdir "$RREMOTE:$p" 2>/dev/null
+  local blog="$STATE/bisync/.last.log" brc=0
+  rclone bisync "$PWD" "$RREMOTE:$p" "${flags[@]}" 2>&1 | tee "$blog"; brc=${PIPESTATUS[0]}
+  if [ "$brc" -ne 0 ]; then
+    if grep -q -- '--resync' "$blog" && [[ " ${flags[*]} " != *" --resync "* ]]; then
+      msg "sync state broken — auto --resync to rebuild the baseline and retry once" "$Y"
+      rclone bisync "$PWD" "$RREMOTE:$p" "${flags[@]}" --resync \
+        || { msg "bisync failed (even with --resync) — see output above" "$R"; return 1; }
+    else msg "bisync failed — see output above; force a rebuild with: ab sync $p resync" "$R"; return 1; fi
+  fi
+  printf '%s ⇄ %s:%s\n' "$(short "$PWD")" "$RREMOTE" "$p" > "$mark"
+  msg "sync done: $(short "$PWD") ⇄ $RREMOTE:$p" "$G"; }
+rcstatus(){ local f n=0 w
+  for f in "$STATE/bisync"/*.ok; do [ -e "$f" ] || break; n=$((n+1))
+    if [ -s "$f" ]; then printf '  %s' "$(cat "$f")"; else printf '  %s' "$(basename "$f" .ok)"; fi
+    printf '  (last: %s)\n' "$(date -r "$f" '+%m-%d %H:%M')"; done
+  w=$(tmux ls -F '#S' 2>/dev/null | grep '^agentbox-sync-' | sed 's/^agentbox-sync-/  watching: /')
+  [ -n "$w" ] && printf '%s\n' "$w"
+  [ "$n" -eq 0 ] && msg "no sync pairs — create one: ab sync <Dropbox path>" "$Y"; return 0; }
+rcremove(){ local p="${1:-}" base
+  [ -n "$p" ] || { msg "usage: ab sync remove <Dropbox path>" "$Y"; return 1; }
+  p="${p#"$HOME"/}"; p="${p#/}"; base="$STATE/bisync/$(rcpair "$p")"
+  ls "$base".* >/dev/null 2>&1 || { msg "no state for $(short "$PWD") ⇄ $RREMOTE:$p" "$Y"; return 1; }
+  rm -f "$base".*; msg "pair state deleted (next sync auto-resyncs)" "$G"; }
+# Minimal watch: open a host tmux session (agentbox-sync-<x>) looping bisync in the background. Attach/kill via ab session.
+rcwatch(){ local s=300 p="" name
+  while [ $# -gt 0 ]; do case "$1" in ''|*[!0-9]*) p="$1";; *) s="$1";; esac; shift; done
+  [ -n "$p" ] || { msg "usage: ab sync watch <Dropbox path> [seconds, default 300]" "$R"; return 1; }
+  [ "$s" -ge 10 ] 2>/dev/null || { msg "minimum interval 10s (each round hits the Dropbox API several times)" "$R"; return 1; }
+  rcok || return 1; needtmux || return 1; selfok || return 1
+  name="agentbox-sync-$(printf '%s' "${p##*/}" | tr -c 'A-Za-z0-9_.-' '_')"
+  tmux has-session -t "=$name" 2>/dev/null && { msg "already watching — attach: ab session; stop: ab session kill ${name#agentbox-}" "$Y"; return 0; }
+  [ "$(wakestat)" = on ] || wakeon || true
+  tmux new -ds "$name" -c "$PWD" bash "$SELF" sync watch-run "$s" "$p"
+  msg "watching $RREMOTE:$p every ${s}s (session ${name#agentbox-}); stop: ab session kill ${name#agentbox-}" "$G"; }
+rcwatchrun(){ local s="$1" p="$2"; AB_RC_YES=1   # internal: the loop run inside the session pane
+  while :; do rcsync "$p" || msg "this round failed, retrying in ${s}s" "$Y"; sleep "$s"; done; }
+
+# ── Command links (agentbox / ab on PATH) ──────────────────────────
+bindir(){ echo "$PREFIX/bin"; }
+link(){ local b n; b=$(bindir); mkdir -p "$b"
+  chmod +x "$SELF" 2>/dev/null
+  has ab && [ "$(command -v ab 2>/dev/null)" != "$b/ab" ] \
+    && msg "note: 'ab' already resolves to $(command -v ab) (apache bench?); the agentbox 'ab' link may shadow it depending on PATH order" "$Y"
+  for n in agentbox ab; do ln -sf "$SELF" "$b/$n"; done
+  msg "linked $b/{agentbox,ab} → $SELF" "$G"; }
+
+# ── First-time phone setup (font / extra-keys / sshd / unkill) ─────
+# Terminal font: without a custom font Termux lacks powerline/box glyphs and renders the extra-key labels as tofu.
+FURL="${AGENTBOX_FONT_URL:-https://github.com/romkatv/powerlevel10k-media/raw/master/MesloLGS%20NF%20Regular.ttf}"
+fontinstall(){ [ "${AGENTBOX_FONT_URL:-}" = none ] && return 0
+  local f=~/.termux/font.ttf tmp; mkdir -p ~/.termux
+  [ -f "$f" ] && [ ! -f "$f.bak" ] && cp "$f" "$f.bak"
+  tmp=$(mktemp) || return 0
+  msg "installing terminal font…" "$G"
+  if { has curl && curl -fsSL "$FURL" -o "$tmp"; } || { has wget && wget -qO "$tmp" "$FURL"; }; then
+    if [ "$(wc -c < "$tmp" 2>/dev/null || echo 0)" -ge 20000 ]; then
+      mv "$tmp" "$f"; has termux-reload-settings && termux-reload-settings
+      msg "font installed → $f (override: AGENTBOX_FONT_URL=<ttf url>, skip: AGENTBOX_FONT_URL=none)" "$G"
+    else msg "font download looks invalid (too small) — keeping the current font" "$Y"; rm -f "$tmp"; fi
+  else msg "font download failed — keeping the current font" "$Y"; rm -f "$tmp"; fi; }
+# Extra-keys row incl. ⇧⇥ (Shift+Tab → how Claude Code cycles normal/auto-accept/plan). Managed block; backs up once.
+termuxprops(){ [ "${AGENTBOX_EXTRA_KEYS:-}" = none ] && return 0
+  local f=~/.termux/termux.properties; mkdir -p ~/.termux
+  [ -f "$f" ] && [ ! -f "$f.bak" ] && cp "$f" "$f.bak"
+  [ -f "$f" ] && sed -i '/#AGENTBOX-EXTRA-KEYS/,$d' "$f" 2>/dev/null
+  if [ -n "${AGENTBOX_EXTRA_KEYS:-}" ]; then
+    { printf '#AGENTBOX-EXTRA-KEYS (managed)\n'; printf 'extra-keys = %s\n' "$AGENTBOX_EXTRA_KEYS"; } >> "$f"
+  else
+    cat >> "$f" <<'EOF'
+#AGENTBOX-EXTRA-KEYS (managed — re-run `ab setup` to refresh; edit ABOVE this line to keep changes)
+# ⇧⇥ = Shift+Tab, cycles Claude Code modes (normal / auto-accept / plan).
+extra-keys = [[ \
+  ESC, TAB, {macro: "SHIFT TAB", display: "⇧⇥"}, CTRL, HOME, UP, END, PGUP \
+], [ \
+  {key: "/", popup: "~"}, {key: "-", popup: "|"}, ALT, KEYBOARD, LEFT, DOWN, RIGHT, PGDN \
+]]
+EOF
+  fi
+  has termux-reload-settings && termux-reload-settings
+  msg "extra-keys deployed → $f (⇧⇥ = Shift+Tab; original at $f.bak)" "$G"; }
+# sshd: Termux is single-user and accepts any username; password auth stays on only until a key is enrolled, then key-only.
+sshauth(){ local sc="$PREFIX/etc/ssh/sshd_config" pa=yes
+  grep -Eq '^[^#[:space:]]' ~/.ssh/authorized_keys 2>/dev/null && pa=no
+  if grep -Eq '^[# ]*PasswordAuthentication' "$sc"; then
+    sed -i -E "s/^[# ]*PasswordAuthentication.*/PasswordAuthentication $pa/" "$sc"
+  else echo "PasswordAuthentication $pa" >> "$sc"; fi
+  if [ "$pa" = no ]; then msg "ssh key enrolled — password login off (key-only)" "$G"
+  else msg "no ssh key enrolled yet — password login on; from the computer: ssh-copy-id -p 8022 <phone-ip>" "$Y"; fi; }
+# Phone side: font → extra-keys → mirror → upgrade → sshd (8022) → wakelock → link.
+initphone(){ fontinstall; termuxprops
+  has termux-reload-settings && termux-reload-settings
+  if [ -t 0 ]; then termux-change-repo; else msg "non-interactive — skipping termux-change-repo" "$Y"; fi
+  pkg update -y || return 1
+  pkg upgrade -y -o Dpkg::Options::=--force-confold || return 1
+  pkg install -y openssh termux-services iproute2 procps proot-distro || return 1
+  mkdir -p ~/.ssh && chmod 700 ~/.ssh
+  touch ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys
+  sshauth
+  [ -e ~/.termux_authinfo ] || { msg "set an SSH login password:" "$G"; passwd; }
+  rm -f "$PREFIX/var/service/sshd/down"
+  pgrep -x sshd >/dev/null || sshd
+  wakeon || true
+  link
+  echo; msg "Done — sshd is on port 8022" "$G"
+  kv "user" "$(whoami)"
+  local ips; ips=$(lanips)
+  kv "  ip" "${ips:-<unknown — check the phone Wi-Fi settings>}"
+  msg "connect from a computer: ssh -p 8022 $(whoami)@<the ip above>" "$G"; return 0; }
+# Stop Android 12+ from killing the box's background processes (the "phantom process" monitor), on-device via Termux's
+# own adb over Wireless Debugging — no computer needed. Guided, since the ports change each time.
+unkill(){ local t="${AGENTBOX_TTY:-/dev/tty}" pport cport code v
+  has adb || { msg "installing android-tools (adb)…" "$G"; pkg install -y android-tools || { msg "couldn't install android-tools (adb)" "$R"; return 1; }; }
+  msg "Stop Android 12+ from killing the box's background processes (the 'phantom process' killer)." "$G"
+  msg "Runs on-device via Termux's own adb over Wireless Debugging — no computer needed." "$G"
+  { printf '\n'
+    printf '  1) Enable Developer options: Settings > About phone > tap "Build number" 7x.\n'
+    printf '  2) Settings > System > Developer options > turn ON "Wireless debugging" (keep the screen open).\n'
+    printf '  3) Tap "Pair device with pairing code" — it shows an IP:PORT and a 6-digit code.\n'; } > "$t"
+  printf '     pairing PORT (the number after the colon): ' > "$t"; IFS= read -r pport < "$t"
+  printf '     pairing CODE (6 digits): '                  > "$t"; IFS= read -r code  < "$t"
+  if [ -n "$pport" ] && [ -n "$code" ]; then adb pair "localhost:$pport" "$code" 2>&1 | sed 's/^/     /'
+  else msg "  (skipped pairing — required on the first run for Android 11+)" "$Y"; fi
+  printf '  4) On the MAIN Wireless debugging screen it shows IP:PORT (a DIFFERENT port than pairing).\n' > "$t"
+  printf '     connect PORT (the number after the colon): ' > "$t"; IFS= read -r cport < "$t"
+  [ -n "$cport" ] && adb connect "localhost:$cport" 2>&1 | sed 's/^/     /'
+  adb devices 2>/dev/null | grep -q 'device$' || { msg "adb didn't connect — the ports change every time; re-check and retry: ab setup" "$R"; return 1; }
+  msg "connected — applying the phantom-process-killer disable…" "$G"
+  adb shell "/system/bin/device_config set_sync_disabled_for_tests persistent"                2>&1 | sed 's/^/     /'
+  adb shell "/system/bin/device_config put activity_manager max_phantom_processes 2147483647" 2>&1 | sed 's/^/     /'
+  adb shell "settings put global settings_enable_monitor_phantom_procs false"                 2>&1 | sed 's/^/     /'
+  v=$(adb shell "/system/bin/device_config get activity_manager max_phantom_processes" 2>/dev/null | tr -d '\r')
+  adb disconnect >/dev/null 2>&1
+  msg "done — max_phantom_processes = ${v:-set}. Android won't kill the box's background processes now." "$G"
+  msg "some ROMs reset this after a reboot/OTA — re-run 'ab setup' (unkill step) if the box starts dying." "$Y"; }
+# ── Guided first-time setup (ab setup) — bootstrap the tool + edit tokens (env folded in) ──
+setup(){ local t="${AGENTBOX_TTY:-/dev/tty}" ans i=0 tot cmd title why rest s; local -a steps
+  steps=(
+    "links|put agentbox on PATH|Creates the ab / agentbox commands in \$PREFIX/bin (skip if the installer already did it)."
+    "init|set up Termux|Glyph font + extra-keys row (⇧⇥/arrows), updates Termux, installs proot-distro, and starts sshd on 8022."
+    "tmux|tmux config|Applies the managed tmux config (mouse off + TUI-friendly keys)."
+    "unkill|stop Android killing the box|Disables the phantom-process killer via on-device adb (Android 12+, guided)."
+    "env|add your API tokens|You'll be asked for each token in turn; press Enter to leave one unchanged."
+  )
+  tot=${#steps[@]}
+  msg "agentbox guided setup ($tot steps) — each is explained and asked before it runs (Ctrl-C quits any time)" "$G"
+  for s in "${steps[@]}"; do
+    i=$((i+1)); cmd="${s%%|*}"; rest="${s#*|}"; title="${rest%%|*}"; why="${rest#*|}"
+    printf '\n' > "$t"; msg "Step $i of $tot — $title" "$G"
+    printf '%s\n' "$why" > "$t"
+    printf 'Enter = run;  n = skip: ' > "$t"
+    IFS= read -r ans < "$t" || ans=n
+    case "$ans" in [Nn]*) msg "skipped — re-run any time: ab setup" "$Y"; continue;; esac
+    case "$cmd" in
+      init) initphone;; tmux) { needtmux && tmuxconf force; } || true;; unkill) unkill || true;;
+      links) link || true;; env) mkenv; envedit;;
+    esac || { msg "step '$cmd' didn't finish cleanly — fix the issue above, then re-run: ab setup" "$R"; return 1; }
+  done
+  printf '\n' > "$t"; msg "setup complete — try: ab claude   (scopes claude to the current folder)" "$G"; }
+
+# ── Update (re-run the installer) ──────────────────────────────────
+update(){ { has curl || has wget; } || { msg "need curl or wget to update" "$R"; return 1; }
+  msg "re-running the installer ($AGBASE/install.sh)…" "$G"
+  if has curl; then curl -fsSL "$AGBASE/install.sh" | bash; else wget -qO- "$AGBASE/install.sh" | bash; fi; }
+
+# ── Help screen ────────────────────────────────────────────────────
+row(){ local n=$((30-$(dw "$1${2:+ $2}"))); ((n<1)) && n=1
+  printf '  %s%s%s%s%*s%s\n' "$G" "$1" "${2:+ $Y$2}" "$Z" "$n" '' "$3"; }
+hd(){ printf '\n%s%s%s\n' "$CY$BD" "$1" "$Z"; }
+usage(){
+  printf '%s\n%s\n' "${BD}agentbox${Z} ${DM}v$VERSION — throwaway, folder-scoped AI-agent boxes (Termux + proot-distro, $DIST)${Z}" \
+    "${DM}usage: ab <command> [args]    ·    ab <name> [cmd]  runs a box${Z}"
+  hd "▍Boxes"
+  row "<name> [cmd]" ""   "run a box scoped to this folder — builds from its profile if missing, runs cmd (else its RUN)"
+  row "" ""               "  no cmd → per-folder tmux session (survives ssh-drop);  unknown name → a default claude box"
+  row save    "<name>"    "golden snapshot of that box's rootfs"
+  row restore "<name>"    "restore that box from its snapshot"
+  row remove  "<name>"    "delete the box rootfs + snapshot (its profile conf is kept)"
+  row rebuild "<name>"    "force-rebuild the box from its profile (keeps the snapshot)"
+  row "pkg <name>" "[add|rm|search]" "edit a simple-mode profile's PKGS, or search the box's apt catalog (rebuild to apply)"
+  hd "▍Sessions  ${DM}(interactive 'ab <name>' auto-opens one per folder; auto wakelock)${Z}"
+  row session "[name]"    "no arg = list + pick to reattach; name = open/reattach this folder's box <name> session"
+  row "session kill" "[name]" "kill a session (no name = pick; wakelock auto-released when all end)"
+  hd "▍Sync  ${DM}(rclone bisync, manual trigger)${Z}"
+  row sync    "[path]"    "sync cwd ⇄ ${RREMOTE}:<path> (no arg = status)"
+  row "sync setup" ""     "install rclone + configure the remote"
+  row "sync watch" "[sec] [path]" "loop-sync in a background session (default 300s)"
+  row "sync remove" "[path]" "delete a pair's sync state"
+  hd "▍Tool"
+  row setup   ""          "guided bootstrap — links · font · keys · tmux · unkill · proot · tokens (re-runnable)"
+  row update  ""          "re-run the installer  (curl \$AGBASE/install.sh | bash)"
+  row help    ""          "this screen          (ab version = version)"
+  printf '\n%s\n' "${DM}profile $(short "$VC")/box-<name>.conf — simple: AGENT(claude|codex|copilot|none)·PKGS·TOKENS·RUN·MOUNT(cwd|none)·EPHEMERAL(0|1)·DESKTOP(xfce)·APP(code|browser)·MITM(0|1)·DIST(base distro);  docker: set INSTALL='…' for raw build steps${Z}"
+  printf '%s\n' "${DM}tokens live in $(short "$ENVF") (0600; only a profile's TOKENS keys are injected; AGENTBOX_* excluded)${Z}"
+  printf '%s\n' "${DM}reserved box names: save restore remove rebuild pkg setup update sync session help version ls list${Z}"
+  printf '%s\n' "${DM}the box shares the phone network — for a different exit IP use a whole-device Android VPN app${Z}"
+  return 0
+}
+
+# ── Command dispatch ───────────────────────────────────────────────
+case "${1:-}" in
+  "") boxls; echo; usage;;                        # bare ab → list boxes + help
+  ls|list) boxls;;
+  save)    shift; boxsave "$@";;
+  restore) shift; boxrestore "$@";;
+  remove)  shift; boxremove "$@";;
+  rebuild) shift; if [ -n "${1:-}" ]; then aboxbuild "$1" force; else msg "which box? ab rebuild <name>" "$Y"; fi;;
+  pkg)     shift; abpkg "$@";;
+  setup)   setup;;
+  update)  update;;
+  sync) shift; case "${1:-}" in
+      setup) rcsetup;;
+      remove) shift; rcremove "$@";;
+      watch) shift; rcwatch "$@";;
+      watch-run) shift; rcwatchrun "$@";;         # internal: the loop run inside a session pane
+      ""|status) rcstatus;;
+      *) rcsync "$@";; esac;;
+  session) shift; session "$@";;
+  help|-h|--help) usage;;
+  version|-v|--version) printf 'agentbox v%s\n' "$VERSION";;
+  *) abox "$@";;                                  # ab <name> [cmd] — build+run a box scoped to the cwd
+esac
