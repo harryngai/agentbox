@@ -1,6 +1,6 @@
 #!/data/data/com.termux/files/usr/bin/bash
 # Version — single source of truth; the installer greps ^VERSION= (keep the line bare, no trailing comment).
-VERSION=3.6.0
+VERSION=3.7.0
 # agentbox — throwaway, folder-scoped AI-agent boxes for a phone (Android Termux + proot-distro ONLY).
 #
 # THREAT MODEL: this protects YOUR FILES from *accidents* (an agent touching the wrong folder), not from a hostile
@@ -283,6 +283,10 @@ EOS
 # `ab <name> [cmd]` — build box <name> from its profile if missing, then run it scoped to the cwd.
 abox(){ local prof="$1"; shift; local cmd="$*" cf alias rootfs \
     INSTALL= TOKENS= RUN= MOUNT=cwd EPHEMERAL=0 DESKTOP= APP=code MITM=0 AGENT= PKGS= DIST= ef efn rc tgt run incmd mitmblock= ms=
+  case "$prof" in host-*)                                        # host-* is a host tmux session, never a box (no profile, no proot)
+    if [ -z "$cmd" ] && [ -t 1 ] && [ -z "${TMUX:-}" ] && [ "${AB_NO_SESSION:-}" != 1 ]; then sessrun "$prof"; return $?; fi
+    if [ -n "$cmd" ]; then exec "${SHELL:-bash}" -lc "$cmd"; else exec "${SHELL:-bash}" -l; fi;;
+  esac
   cf=$(aboxconf "$prof"); alias=$(aboxalias "$prof")
   has proot-distro || pkg install -y proot-distro || { msg "proot-distro install failed" "$R"; return 1; }
   [ -f "$cf" ] || { mkdir -p "$VC"; aboxdefault "$cf" "$prof" || return 1
@@ -500,13 +504,19 @@ sesspick(){ local mode="${1:-enter}" names=() n path i=1 c
 slug(){ local s; s=$(printf '%s' "${1##*/}" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9' '-' | sed 's/-\{2,\}/-/g; s/^-//; s/-$//'); printf '%s' "${s:-x}"; }
 # Open a FRESH session (ab-<box>-<folder>-<rand>) running box <name> here (survives ssh drop / app switch).
 # Always new — each launch gets its own; a random suffix keeps same-folder launches distinct. Reattach with 'ab session'.
+# A `host-*` name opens a plain HOST shell (no box, no proot) — still an ab-* session so it lists/kills/wakelocks the same.
 sessrun(){ local prof="$1"; shift; local s base
-  needtmux || return 1; selfok || return 1
+  needtmux || return 1
+  [ "${prof#host-}" = "$prof" ] && { selfok || return 1; }      # box pane re-runs $SELF; host pane doesn't, so skip the parse gate
   [ "$(wakestat)" = on ] || wakeon || true
   base="ab-$(slug "$prof")-$(slug "$PWD")"
   s="$base-$(printf '%04d' "$((RANDOM % 10000))")"
   while tmux has-session -t "=$s" 2>/dev/null; do s="$base-$(printf '%04d' "$((RANDOM % 10000))")"; done
-  tmux new -s "$s" -c "$PWD" bash "$SELF" "$prof" "$@"
+  case "$prof" in
+    host-*) [ "$#" -gt 0 ] && tmux new -s "$s" -c "$PWD" "${SHELL:-bash}" -lc "$*" \
+                           || tmux new -s "$s" -c "$PWD";;       # no cmd → the default interactive host shell
+    *)      tmux new -s "$s" -c "$PWD" bash "$SELF" "$prof" "$@";;
+  esac
   anysession || { [ "$(wakestat)" = on ] && wakeoff; }; return 0; }
 session(){ local k n; case "${1:-}" in
     ""|ls|list) sesspick;;
@@ -787,7 +797,7 @@ usage(){
   row rebuild "<name>"    "force-rebuild the box from its profile (keeps the snapshot)"
   row "pkg <name>" "[add|rm|search]" "edit a simple profile's PKGS or search its apt catalog (rebuild to apply)"
   hd "▍Sessions" "(interactive 'ab <name>' opens a fresh one each launch; auto wakelock)"
-  row session "[name]"    "no arg = list + pick to reattach; name = open a new session here"
+  row session "[name]"    "no arg = list + pick to reattach; name = a new session (host-* → a host shell, not a box)"
   row "session kill" "[name]" "kill a session (no name = pick; wakelock frees when all end)"
   hd "▍Sync" "(rclone bisync, manual trigger)"
   row sync    "[path]"    "sync cwd ⇄ ${RREMOTE}:<path> (no arg = status)"
