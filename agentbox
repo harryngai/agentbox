@@ -1,6 +1,6 @@
 #!/data/data/com.termux/files/usr/bin/bash
 # Version — single source of truth; the installer greps ^VERSION= (keep the line bare, no trailing comment).
-VERSION=3.9.1
+VERSION=3.10.0
 # agentbox — throwaway, folder-scoped AI-agent boxes for a phone (Android Termux + proot-distro ONLY).
 #
 # THREAT MODEL: this protects YOUR FILES from *accidents* (an agent touching the wrong folder), not from a hostile
@@ -117,17 +117,18 @@ aboxtemplates(){ local f b out=; for f in "$TPL"/*.conf; do [ -e "$f" ] || break
 wtarget(){ printf '/work-%s' "$(printf '%s' "${PWD#/}" | tr 'A-Z' 'a-z' | sed 's#[^a-z0-9]#-#g; s#-\{2,\}#-#g; s#-$##')"; }
 # Built-in fallback profile: baked in so the tool works with no templates dir at all (git + gh + node22 + claude-code).
 builtin_default_profile(){ cat <<'EOF'
-# agentbox box profile: default — Claude Code scoped to ONE folder (built-in fallback). YOUR copy; edit freely.
-# template-version: 3.9.0
-# Simple mode: AGENT picks a built-in install recipe — no shell to write. Full control? set INSTALL='…' (docker mode).
-AGENT=claude            # claude | codex | copilot | none
-PKGS="gh git curl"      # extra apt packages to bake in (space-separated), optional
-TOKENS="CLAUDE_CODE_OAUTH_TOKEN GH_TOKEN"
-RUN="claude"
-MOUNT=cwd
-EPHEMERAL=0
-#DIST=debian            # base distro for this box (overrides the global AGENTBOX_DIST)
-#MITM=0
+# agentbox box profile: claude — Claude Code, kept to just this one folder. YOUR copy, tweak it freely.
+# template-version: 3.8.0                    # bumps when this template gains new options — ab tells you if yours is behind
+# Baked-in fallback, identical to the claude template — used when no shipped templates are present.
+# Simple mode — just pick an AGENT and go. Want full control? Set INSTALL='…' and write the build steps yourself.
+AGENT=claude                        # who runs the box:  claude · codex · copilot · none
+PKGS="gh git curl"                  # extra apt packages baked in — 'gh' also sets up GitHub so you can push (with GH_TOKEN)
+TOKENS="CLAUDE_CODE_OAUTH_TOKEN GH_TOKEN"  # which of your saved keys get passed in — nothing else of yours leaks into the box
+RUN="claude"                        # what runs when you enter (empty = a plain shell);  `ab claude <cmd>` overrides it
+MOUNT=cwd                           # cwd = share this folder (opens as /work-<name>) · none = share nothing (sealed)
+EPHEMERAL=0                         # 0 = keep the box around (quick to re-enter) · 1 = fresh box each run, gone on exit
+#DIST=debian                        # base distro for this box (overrides the global default) — e.g. debian, ubuntu, kali
+#MITM=0                             # 1 = watch the box's web traffic through mitmweb (proxy 127.0.0.1:8082, viewer :8083)
 EOF
 }
 # Read a profile/template's '# template-version:' stamp (empty if unstamped, e.g. a pre-3.8 copy).
@@ -135,7 +136,9 @@ tplver(){ sed -n 's/^# *template-version:[[:space:]]*\([^[:space:]]*\).*/\1/p' "
 # Seed a profile file: a shipped template of that name if valid, else the built-in default (kept 0600).
 aboxdefault(){ local path="$1" name="$2" src="$TPL/$name.conf"
   if [ -f "$src" ] && [ -s "$src" ] && grep -q '^# agentbox box profile' "$src"; then ( umask 077; cp "$src" "$path" )
-  else ( umask 077; builtin_default_profile > "$path" ); fi; }
+  else ( umask 077; builtin_default_profile > "$path" )   # no valid template → the built-in default (a CLAUDE box)
+    msg "no '$name' template found — seeded $(short "$path") from the built-in default, which is a CLAUDE box. If you expected a shipped template ('$name'), run 'ab update' to (re)fetch it, then: ab remove $name && ab $name" "$Y"
+  fi; }
 aboxdrop(){ local a="$1" r; [ -n "$a" ] || return 0     # delete a built box (by alias); dir-remove as a fallback
   proot-distro remove "$a" 2>/dev/null
   r=$(pdroot "$a"); [ -z "$r" ] || rm -rf "${r%/rootfs}"; }

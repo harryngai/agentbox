@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# agentbox installer — v3.9.1 (version stamp only: this always pulls the latest agentbox from main).
+# agentbox installer — v3.10.0 (version stamp only: this always pulls the latest agentbox from main).
 #   curl -fsSL https://raw.githubusercontent.com/harryngai/agentbox/main/install.sh | bash
 # Downloads the agentbox script, makes it executable, and links `agentbox` + `ab` onto your PATH.
 # Safe to re-run any time — it just pulls the latest version (so this doubles as an updater).
@@ -59,7 +59,7 @@ fi
 # on first use. Re-running install.sh refreshes these pristine templates without touching your edited copies in ~/.config.
 TPLDIR="$(dirname "$DEST")/templates"
 mkdir -p "$TPLDIR"
-TEMPLATES="claude codex copilot run web"
+TEMPLATES="claude codex copilot run web desktop"
 tpl_ok=1; tpls=
 for t in $TEMPLATES; do
   if fetch "$BASE/templates/$t.conf" "$TPLDIR/$t.conf" \
