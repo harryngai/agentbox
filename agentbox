@@ -1,6 +1,6 @@
 #!/data/data/com.termux/files/usr/bin/bash
 # Version — single source of truth; the installer greps ^VERSION= (keep the line bare, no trailing comment).
-VERSION=3.5.0
+VERSION=3.6.0
 # agentbox — throwaway, folder-scoped AI-agent boxes for a phone (Android Termux + proot-distro ONLY).
 #
 # THREAT MODEL: this protects YOUR FILES from *accidents* (an agent touching the wrong folder), not from a hostile
@@ -47,6 +47,9 @@ dw(){ local s="$1" w=0 i ch; for ((i=0;i<${#s};i++)); do ch=${s:i:1}
   esac; done; echo $w; }
 kv(){ local n=$((20-$(dw "$1"))); ((n<0)) && n=0
   printf '%s%*s: %s%s%s\n' "$1" "$n" '' "${3:-}" "$2" "$Z"; }
+# Status row (boxls): 2-space indent, bold key, no colon — aligns with the help's row() so bare `ab` reads as one doc.
+st(){ local n=$((11-$(dw "$1"))); ((n<1)) && n=1
+  printf '  %s%s%s%*s%s%s%s\n' "$BD" "$1" "$Z" "$n" '' "${3:-}" "$2" "$Z"; }
 short(){ local p="$1"; case "$p" in "$HOME"|"$HOME"/*) p="~${p#"$HOME"}";;
     "${PREFIX:-//}"/*) p="\$PREFIX${p#"$PREFIX"}";; esac; printf '%s\n' "$p"; }
 # All of the phone's IPv4 addresses (LAN-like first), minus loopback — for the ssh hint printed by setup.
@@ -109,7 +112,7 @@ envedit(){ mkenv
 aboxconf(){ echo "$VC/box-$1.conf"; }
 aboxalias(){ echo "agentbox-$1"; }   # proot container prefix (agentbox-<name>); tmux sessions use the shorter ab- prefix
 aboxtemplates(){ local f b out=; for f in "$TPL"/*.conf; do [ -e "$f" ] || break
-    b=$(basename "$f" .conf); out="$out $b"; done; echo "${out# }"; }
+    b=$(basename "$f" .conf); out="$out · $b"; done; echo "${out# · }"; }
 # In-box bind/cd target: a unique /work-<kebab(cwd)> per host folder (only [a-z0-9-], so it is always shell-safe).
 wtarget(){ printf '/work-%s' "$(printf '%s' "${PWD#/}" | tr 'A-Z' 'a-z' | sed 's#[^a-z0-9]#-#g; s#-\{2,\}#-#g; s#-$##')"; }
 # Built-in fallback profile: baked in so the tool works with no templates dir at all (git + gh + node22 + claude-code).
@@ -324,15 +327,15 @@ export NODE_EXTRA_CA_CERTS=$HOME/.mitmproxy/mitmproxy-ca-cert.pem HTTP_PROXY=htt
 boxls(){ local f prof n=0 sn=0 tpl
   for f in "$VC"/box-*.conf; do [ -e "$f" ] || break
     prof=$(basename "$f" .conf); prof=${prof#box-}; n=$((n+1))
-    [ -n "$(pdroot "$(aboxalias "$prof")")" ] && kv "$prof" "built · ab $prof" "$G" \
-      || kv "$prof" "profile · ab $prof builds it" "$Y"
+    [ -n "$(pdroot "$(aboxalias "$prof")")" ] && st "$prof" "built · ab $prof" "$G" \
+      || st "$prof" "profile · ab $prof builds it" "$Y"
   done
-  [ "$n" -eq 0 ] && msg "no boxes yet — ab claude scopes an agent to this folder" "$Y"
-  tpl=$(aboxtemplates); [ -n "$tpl" ] && kv "templates" "$tpl · ab <name> to create" "$DM"
+  [ "$n" -eq 0 ] && st "boxes" "none yet · ab claude scopes an agent here" "$Y"
+  tpl=$(aboxtemplates); [ -n "$tpl" ] && st "templates" "$tpl   (ab <name> to create)" "$DM"
   for f in "$STATE"/box-snapshot-*.tar.gz; do [ -e "$f" ] || break
     prof=$(basename "$f" .tar.gz); prof=${prof#box-snapshot-}
-    kv "snapshot $prof" "$(du -h "$f" | cut -f1) · $(date -r "$f" '+%Y-%m-%d %H:%M')" "$G"; sn=$((sn+1)); done
-  [ "$sn" -eq 0 ] && kv "snapshots" "none · ab save <name>" "$DM"; return 0; }
+    st "snapshot $prof" "$(du -h "$f" | cut -f1) · $(date -r "$f" '+%Y-%m-%d %H:%M')" "$G"; sn=$((sn+1)); done
+  [ "$sn" -eq 0 ] && st "snapshots" "none · ab save <name>" "$DM"; return 0; }
 # `ab remove <name>` — stop its desktop if running, delete rootfs + snapshot; then ask whether to delete the profile conf.
 boxremove(){ local prof="${1:-}" a snap cf; [ -n "$prof" ] || { msg "which box? ab remove <name>" "$Y"; return 1; }
   aboxguard "$prof"; a=$(aboxalias "$prof"); snap="$STATE/box-snapshot-$prof.tar.gz"
@@ -748,43 +751,65 @@ update(){ { has curl || has wget; } || { msg "need curl or wget to update" "$R";
   else wget -qO- "$AGBASE/install.sh" | AGENTBOX_BASE="$AGBASE" AGENTBOX_SKIP_SETUP=1 bash; fi; }
 
 # ── Help screen ────────────────────────────────────────────────────
-row(){ local n=$((30-$(dw "$1${2:+ $2}"))); ((n<1)) && n=1
-  printf '  %s%s%s%s%*s%s\n' "$G" "$1" "${2:+ $Y$2}" "$Z" "$n" '' "$3"; }
-hd(){ printf '\n%s%s%s\n' "$CY$BD" "$1" "$Z"; }
+# Colour language (shared with boxls): BD = the literal command you type, Y = an arg you supply,
+# CY·BD = section header, G = reserved for status ("built"/"ready"), DM = notes. WIDE (set in usage,
+# visible here via bash dynamic scope) picks a 2-column layout on wide terminals and a stacked one on
+# a narrow phone screen so descriptions get a clean hang-indent instead of wrapping to column 0.
+row(){ local n
+  if [ "${WIDE:-1}" = 1 ]; then n=$((30-$(dw "$1${2:+ $2}"))); ((n<1)) && n=1
+    printf '  %s%s%s%s%*s%s\n' "$BD" "$1" "${2:+ $Y$2}" "$Z" "$n" '' "$3"
+  elif [ -z "$1$2" ]; then printf '      %s\n' "$3"      # continuation line (empty command)
+  else printf '  %s%s%s%s\n      %s\n' "$BD" "$1" "${2:+ $Y$2}" "$Z" "$3"; fi; }
+hd(){ printf '\n%s%s%s' "$CY$BD" "$1" "$Z"
+  [ -n "${2:-}" ] && { [ "${WIDE:-1}" = 1 ] && printf '  %s%s%s' "$DM" "$2" "$Z" || printf '\n  %s%s%s' "$DM" "$2" "$Z"; }
+  printf '\n'; }
+# Note bullet (▍Notes): dim "· label  text", label padded so the text column lines up.
+nt(){ printf '  %s· %-8s %s%s\n' "$DM" "$1" "$2" "$Z"; }
 usage(){
-  printf '%s\n%s\n' "${BD}agentbox${Z} ${DM}v$VERSION — throwaway, folder-scoped AI-agent boxes (Termux + proot-distro, $DIST)${Z}" \
-    "${DM}usage: ab <command> [args]    ·    ab <name> [cmd]  runs a box${Z}"
+  local WIDE=1 cols withstatus="${1:-}"; cols=$(tput cols 2>/dev/null || echo "${COLUMNS:-80}"); [ "$cols" -ge 1 ] 2>/dev/null || cols=80
+  [ "$cols" -lt 72 ] && WIDE=0
+  if [ "$WIDE" = 1 ]; then                                       # banner + a 2-line usage (tool commands / box run)
+    printf '%s %s\n' "${BD}agentbox${Z}" "${DM}v$VERSION — throwaway, folder-scoped AI-agent boxes (Termux + proot-distro · $DIST)${Z}"
+    printf '%susage:%s  ab <command> [args]\n' "$DM" "$Z"
+    printf '        ab <name> [cmd]   %srun a box scoped to this folder%s\n' "$DM" "$Z"
+  else
+    printf '%s %s\n' "${BD}agentbox${Z}" "${DM}v$VERSION · $DIST${Z}"
+    printf 'ab <command> [args]\nab <name> [cmd]  %s(a box)%s\n' "$DM" "$Z"
+  fi
+  [ "$withstatus" = full ] && { printf '\n'; boxls; }            # bare `ab` shows current boxes/templates/snapshots here
   hd "▍Boxes"
-  row "<name> [cmd]" ""   "run a box scoped to this folder — builds from its profile if missing, runs cmd (else its RUN)"
-  row "" ""               "  no cmd → a fresh tmux session each launch (ab-<box>-<folder>-<rand>, survives ssh-drop)"
-  row "" ""               "  reattach an earlier session with 'ab session';  unknown name → a default claude box"
+  row "<name> [cmd]" ""   "run a box scoped to this folder — builds if missing, runs cmd (else RUN)"
+  row "" ""               "  no cmd → a fresh tmux session each launch (survives ssh-drop)"
+  row "" ""               "  reattach an earlier one with 'ab session'; unknown name → a default claude box"
   row save    "<name>"    "golden snapshot of that box's rootfs"
   row restore "<name>"    "restore that box from its snapshot"
-  row remove  "<name>"    "delete the box rootfs + snapshot (asks whether to delete the profile conf too)"
+  row remove  "<name>"    "delete the box rootfs + snapshot (also asks about the profile conf)"
   row rebuild "<name>"    "force-rebuild the box from its profile (keeps the snapshot)"
-  row "pkg <name>" "[add|rm|search]" "edit a simple-mode profile's PKGS, or search the box's apt catalog (rebuild to apply)"
-  hd "▍Sessions  ${DM}(interactive 'ab <name>' opens a fresh one each launch; auto wakelock)${Z}"
-  row session "[name]"    "no arg = list + pick to reattach; name = open a new <name> session here (like 'ab <name>')"
-  row "session kill" "[name]" "kill a session (no name = pick; wakelock auto-released when all end)"
-  hd "▍Sync  ${DM}(rclone bisync, manual trigger)${Z}"
+  row "pkg <name>" "[add|rm|search]" "edit a simple profile's PKGS or search its apt catalog (rebuild to apply)"
+  hd "▍Sessions" "(interactive 'ab <name>' opens a fresh one each launch; auto wakelock)"
+  row session "[name]"    "no arg = list + pick to reattach; name = open a new session here"
+  row "session kill" "[name]" "kill a session (no name = pick; wakelock frees when all end)"
+  hd "▍Sync" "(rclone bisync, manual trigger)"
   row sync    "[path]"    "sync cwd ⇄ ${RREMOTE}:<path> (no arg = status)"
   row "sync setup" ""     "install rclone + configure the remote"
   row "sync watch" "[sec] [path]" "loop-sync in a background session (default 300s; no path = all pairs)"
   row "sync remove" "[path]" "delete a pair's sync state"
   hd "▍Tool"
-  row setup   ""          "guided bootstrap — links · font · keys · tmux · unkill · proot · tokens (re-runnable)"
-  row update  ""          "pull the latest version (code + templates only — run setup to reconfigure)"
-  row help    ""          "this screen          (ab version = version)"
-  printf '\n%s\n' "${DM}profile $(short "$VC")/box-<name>.conf — simple: AGENT(claude|codex|copilot|none)·PKGS·TOKENS·RUN·MOUNT(cwd|none)·EPHEMERAL(0|1)·DESKTOP(xfce)·APP(code|browser)·MITM(0|1)·DIST(base distro);  docker: set INSTALL='…' for raw build steps${Z}"
-  printf '%s\n' "${DM}tokens live in $(short "$ENVF") (0600; only a profile's TOKENS keys are injected; AGENTBOX_* excluded)${Z}"
-  printf '%s\n' "${DM}reserved box names: save restore remove rebuild pkg setup update sync session help version ls list${Z}"
-  printf '%s\n' "${DM}the box shares the phone network — for a different exit IP use a whole-device Android VPN app${Z}"
+  row setup   ""          "guided bootstrap — links · font · keys · tmux · unkill · proot · tokens"
+  row update  ""          "pull the latest version (code + templates only)"
+  row help    ""          "show this help screen"
+  row version ""          "print the agentbox version"
+  hd "▍Notes"
+  nt profile  "$(short "$VC")/box-<name>.conf — AGENT·PKGS·TOKENS·RUN·MOUNT·EPHEMERAL·DESKTOP·APP·MITM·DIST  (docker: set INSTALL='…')"
+  nt tokens   "$(short "$ENVF")  (0600; only a profile's TOKENS keys are injected; AGENTBOX_* excluded)"
+  nt reserved "save restore remove rebuild pkg setup update sync session help version ls list"
+  nt network  "shares the phone network — for a different exit IP use a whole-device Android VPN app"
   return 0
 }
 
 # ── Command dispatch ───────────────────────────────────────────────
 case "${1:-}" in
-  "") boxls; echo; usage;;                        # bare ab → list boxes + help
+  "") usage full;;                                # bare ab → banner + current boxes + help
   ls|list) boxls;;
   save)    shift; boxsave "$@";;
   restore) shift; boxrestore "$@";;
