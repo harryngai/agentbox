@@ -117,7 +117,7 @@ builtin_default_profile(){ cat <<'EOF'
 # agentbox box profile: default — Claude Code scoped to ONE folder (built-in fallback). YOUR copy; edit freely.
 # Simple mode: AGENT picks a built-in install recipe — no shell to write. Full control? set INSTALL='…' (docker mode).
 AGENT=claude            # claude | codex | copilot | none
-PKGS=""                 # extra apt packages to bake in (space-separated), optional
+PKGS="gh git curl"      # extra apt packages to bake in (space-separated), optional
 TOKENS="CLAUDE_CODE_OAUTH_TOKEN"
 RUN="claude"
 MOUNT=cwd
@@ -333,12 +333,15 @@ boxls(){ local f prof n=0 sn=0 tpl
     prof=$(basename "$f" .tar.gz); prof=${prof#box-snapshot-}
     kv "snapshot $prof" "$(du -h "$f" | cut -f1) · $(date -r "$f" '+%Y-%m-%d %H:%M')" "$G"; sn=$((sn+1)); done
   [ "$sn" -eq 0 ] && kv "snapshots" "none · ab save <name>" "$DM"; return 0; }
-# `ab remove <name>` — stop its desktop if running, delete rootfs + snapshot; KEEP the profile conf.
-boxremove(){ local prof="${1:-}" a snap; [ -n "$prof" ] || { msg "which box? ab remove <name>" "$Y"; return 1; }
+# `ab remove <name>` — stop its desktop if running, delete rootfs + snapshot; then ask whether to delete the profile conf.
+boxremove(){ local prof="${1:-}" a snap cf; [ -n "$prof" ] || { msg "which box? ab remove <name>" "$Y"; return 1; }
   aboxguard "$prof"; a=$(aboxalias "$prof"); snap="$STATE/box-snapshot-$prof.tar.gz"
   [ -n "$(pdroot "$a")" ] && { aboxdrop "$a"; msg "box '$prof' rootfs removed" "$G"; } || msg "no built box for '$prof'" "$Y"
   [ -f "$snap" ] && { rm -f "$snap"; msg "snapshot for '$prof' deleted" "$G"; }
-  msg "profile $(short "$(aboxconf "$prof")") kept" "$Y"; return 0; }
+  cf=$(aboxconf "$prof")
+  if [ -f "$cf" ]; then printf 'delete profile %s too? [y/N] ' "$(short "$cf")"; read -r a || a=
+    case "$a" in y|Y|yes|YES) rm -f "$cf"; msg "profile $(short "$cf") deleted" "$G";; *) msg "profile $(short "$cf") kept" "$Y";; esac
+  fi; return 0; }
 
 # ── Package helper (simple-mode profiles) ──────────────────────────
 # `ab pkg <name> search <term>` lists matches from the built box's apt catalog; `add`/`rm <pkg…>` edit the profile's
@@ -709,7 +712,7 @@ usage(){
   row "" ""               "  no cmd → per-folder tmux session (survives ssh-drop);  unknown name → a default claude box"
   row save    "<name>"    "golden snapshot of that box's rootfs"
   row restore "<name>"    "restore that box from its snapshot"
-  row remove  "<name>"    "delete the box rootfs + snapshot (its profile conf is kept)"
+  row remove  "<name>"    "delete the box rootfs + snapshot (asks whether to delete the profile conf too)"
   row rebuild "<name>"    "force-rebuild the box from its profile (keeps the snapshot)"
   row "pkg <name>" "[add|rm|search]" "edit a simple-mode profile's PKGS, or search the box's apt catalog (rebuild to apply)"
   hd "▍Sessions  ${DM}(interactive 'ab <name>' auto-opens one per folder; auto wakelock)${Z}"
