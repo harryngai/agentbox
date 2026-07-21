@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# agentbox installer — v3.5.0 (version stamp only: this always pulls the latest agentbox from main).
+# agentbox installer — v3.8.0 (version stamp only: this always pulls the latest agentbox from main).
 #   curl -fsSL https://raw.githubusercontent.com/harryngai/agentbox/main/install.sh | bash
 # Downloads the agentbox script, makes it executable, and links `agentbox` + `ab` onto your PATH.
 # Safe to re-run any time — it just pulls the latest version (so this doubles as an updater).
@@ -59,13 +59,15 @@ fi
 # on first use. Re-running install.sh refreshes these pristine templates without touching your edited copies in ~/.config.
 TPLDIR="$(dirname "$DEST")/templates"
 mkdir -p "$TPLDIR"
-tpl_ok=1
+tpl_ok=1; tpls=
 for t in claude codex copilot shell web; do
   if fetch "$BASE/templates/$t.conf" "$TPLDIR/$t.conf" \
-     && head -1 "$TPLDIR/$t.conf" | grep -q '^# agentbox box profile'; then :
+     && head -1 "$TPLDIR/$t.conf" | grep -q '^# agentbox box profile'; then
+    v=$(sed -n 's/^# *template-version:[[:space:]]*\([^[:space:]]*\).*/\1/p' "$TPLDIR/$t.conf" | head -1)
+    tpls="${tpls:+$tpls, }$t ${v:-?}"
   else err "  template '$t' failed or looks wrong (404/HTML?)"; rm -f "$TPLDIR/$t.conf"; tpl_ok=; fi
 done
-if [ -n "$tpl_ok" ]; then say "templates → $TPLDIR"; else err "some templates failed — re-run install.sh when the network is back"; fi
+if [ -n "$tpl_ok" ]; then say "templates → $TPLDIR  ($tpls)"; else err "some templates failed — re-run install.sh when the network is back"; fi
 
 printf '\n'
 say "done — $(bash "$DEST" version 2>/dev/null || echo agentbox)"

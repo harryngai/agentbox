@@ -1,6 +1,6 @@
 #!/data/data/com.termux/files/usr/bin/bash
 # Version — single source of truth; the installer greps ^VERSION= (keep the line bare, no trailing comment).
-VERSION=3.7.0
+VERSION=3.8.0
 # agentbox — throwaway, folder-scoped AI-agent boxes for a phone (Android Termux + proot-distro ONLY).
 #
 # THREAT MODEL: this protects YOUR FILES from *accidents* (an agent touching the wrong folder), not from a hostile
@@ -118,6 +118,7 @@ wtarget(){ printf '/work-%s' "$(printf '%s' "${PWD#/}" | tr 'A-Z' 'a-z' | sed 's
 # Built-in fallback profile: baked in so the tool works with no templates dir at all (git + gh + node22 + claude-code).
 builtin_default_profile(){ cat <<'EOF'
 # agentbox box profile: default — Claude Code scoped to ONE folder (built-in fallback). YOUR copy; edit freely.
+# template-version: 3.8.0
 # Simple mode: AGENT picks a built-in install recipe — no shell to write. Full control? set INSTALL='…' (docker mode).
 AGENT=claude            # claude | codex | copilot | none
 PKGS="gh git curl"      # extra apt packages to bake in (space-separated), optional
@@ -129,6 +130,8 @@ EPHEMERAL=0
 #MITM=0
 EOF
 }
+# Read a profile/template's '# template-version:' stamp (empty if unstamped, e.g. a pre-3.8 copy).
+tplver(){ sed -n 's/^# *template-version:[[:space:]]*\([^[:space:]]*\).*/\1/p' "$1" 2>/dev/null | head -1; }
 # Seed a profile file: a shipped template of that name if valid, else the built-in default (kept 0600).
 aboxdefault(){ local path="$1" name="$2" src="$TPL/$name.conf"
   if [ -f "$src" ] && [ -s "$src" ] && grep -q '^# agentbox box profile' "$src"; then ( umask 077; cp "$src" "$path" )
@@ -289,8 +292,12 @@ abox(){ local prof="$1"; shift; local cmd="$*" cf alias rootfs \
   esac
   cf=$(aboxconf "$prof"); alias=$(aboxalias "$prof")
   has proot-distro || pkg install -y proot-distro || { msg "proot-distro install failed" "$R"; return 1; }
-  [ -f "$cf" ] || { mkdir -p "$VC"; aboxdefault "$cf" "$prof" || return 1
-    msg "new profile $(short "$cf") — binds only the launch folder, injects only its tokens (edit it directly)" "$Y"; }
+  if [ -f "$cf" ]; then                                         # existing copy: warn if the pristine template moved past it
+    local cv tv src="$TPL/$prof.conf"; cv=$(tplver "$cf"); tv=$(tplver "$src" 2>/dev/null)
+    [ -n "$cv" ] && [ -n "$tv" ] && [ "$cv" != "$tv" ] \
+      && msg "note: $(short "$cf") is from the $prof template v$cv; the current template is v$tv — re-check it for new options" "$Y"
+  else mkdir -p "$VC"; aboxdefault "$cf" "$prof" || return 1
+    msg "new profile $(short "$cf") — binds only the launch folder, injects only its tokens (edit it directly)" "$Y"; fi
   . "$cf"; mkenv
   # Auto-session: an interactive, command-less CLI box opens a fresh tmux session each launch (survives ssh-drop;
   # reattach earlier ones with 'ab session'). Explicit cmd / piped output / in tmux / desktop box → foreground. Off: AB_NO_SESSION=1.
