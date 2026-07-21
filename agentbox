@@ -1,6 +1,6 @@
 #!/data/data/com.termux/files/usr/bin/bash
 # Version — single source of truth; the installer greps ^VERSION= (keep the line bare, no trailing comment).
-VERSION=3.4.0
+VERSION=3.4.1
 # agentbox — throwaway, folder-scoped AI-agent boxes for a phone (Android Termux + proot-distro ONLY).
 #
 # THREAT MODEL: this protects YOUR FILES from *accidents* (an agent touching the wrong folder), not from a hostile
@@ -278,7 +278,9 @@ EOS
   kv "  password (both)" "$pw" "$G"
   msg "  stop / drop the box: ab remove $prof" "$Y"; return 0; }
 # `ab <name> [cmd]` — build box <name> from its profile if missing, then run it scoped to the cwd.
-abox(){ local prof="$1"; shift; local cmd="$*" cf alias rootfs \
+abox(){ local prof="$1"; shift; local newsess=
+  case "${1:-}" in -n|--new) newsess=1; shift;; esac   # -n/--new → an extra session for this folder (default re-attaches)
+  local cmd="$*" cf alias rootfs \
     INSTALL= TOKENS= RUN= MOUNT=cwd EPHEMERAL=0 DESKTOP= APP=code MITM=0 AGENT= PKGS= DIST= ef efn rc tgt run incmd mitmblock= ms=
   cf=$(aboxconf "$prof"); alias=$(aboxalias "$prof")
   has proot-distro || pkg install -y proot-distro || { msg "proot-distro install failed" "$R"; return 1; }
@@ -288,7 +290,7 @@ abox(){ local prof="$1"; shift; local cmd="$*" cf alias rootfs \
   # Auto-session: an interactive, command-less CLI box runs inside a per-folder tmux session (survives ssh-drop; two
   # folders → two sessions). Explicit cmd / piped output / already in tmux / desktop box → foreground. Off: AB_NO_SESSION=1.
   if [ -z "$DESKTOP" ] && [ -z "$cmd" ] && [ -t 1 ] && [ -z "${TMUX:-}" ] && [ "${AB_NO_SESSION:-}" != 1 ]; then
-    sessrun "$prof"; return $?
+    sessrun "$newsess" "$prof"; return $?
   fi
   # Build when missing; a non-desktop EPHEMERAL box rebuilds fresh each run (desktop boxes only when missing — too heavy).
   if { [ -z "$DESKTOP" ] && [ "$EPHEMERAL" = 1 ]; } || [ -z "$(pdroot "$alias")" ]; then
@@ -496,9 +498,11 @@ sesspick(){ local mode="${1:-enter}" names=() n path i=1 c
 # A per-folder session tag so two folders running the same box get two sessions (re-attach stays deterministic).
 sesstag(){ printf '%s' "$PWD" | cksum | cut -d' ' -f1; }
 # Open/reattach a persistent session (agentbox-<name>-<folder>) running box <name> here (survives ssh drop / app switch).
-sessrun(){ local prof="$1"; shift; local s; s="$(aboxalias "$prof")-$(sesstag)"
+# new (arg 1) non-empty → don't reattach; open an ADDITIONAL numbered session (-2, -3, …) for this same folder.
+sessrun(){ local new="$1" prof="$2"; shift 2; local s base i=2; base="$(aboxalias "$prof")-$(sesstag)"; s="$base"
   needtmux || return 1; selfok || return 1
   [ "$(wakestat)" = on ] || wakeon || true
+  [ -n "$new" ] && while tmux has-session -t "=$s" 2>/dev/null; do s="$base-$i"; i=$((i+1)); done
   tmux new -As "$s" -c "$PWD" bash "$SELF" "$prof" "$@"
   anysession || { [ "$(wakestat)" = on ] && wakeoff; }; return 0; }
 session(){ local k n; case "${1:-}" in
@@ -753,6 +757,7 @@ usage(){
   hd "▍Boxes"
   row "<name> [cmd]" ""   "run a box scoped to this folder — builds from its profile if missing, runs cmd (else its RUN)"
   row "" ""               "  no cmd → per-folder tmux session (survives ssh-drop);  unknown name → a default claude box"
+  row "<name> -n" ""      "  -n / --new opens an extra session in the SAME folder (default re-attaches the existing one)"
   row save    "<name>"    "golden snapshot of that box's rootfs"
   row restore "<name>"    "restore that box from its snapshot"
   row remove  "<name>"    "delete the box rootfs + snapshot (asks whether to delete the profile conf too)"
