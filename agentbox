@@ -160,7 +160,7 @@ GH
 # then INSTALL (docker mode) or the AGENT/PKGS recipe (simple mode), then mitmproxy (MITM=1), then the desktop (DESKTOP).
 aboxbuild(){ local prof="$1" force="${2:-}" cf alias rootfs DIST="$DIST" \
     INSTALL= TOKENS= RUN= MOUNT=cwd EPHEMERAL=0 DESKTOP= APP=code MITM=0 AGENT=none PKGS=
-  cf=$(aboxconf "$prof"); alias=$(aboxalias "$prof"); [ -f "$cf" ] && . "$cf"
+  cf=$(aboxconf "$prof"); alias=$(aboxalias "$prof"); [ -f "$cf" ] && . "$cf"; DIST="${DIST:-debian}"
   [ -n "$INSTALL" ] || INSTALL=$(agent_recipe "$AGENT" "$PKGS") \
     || { msg "profile '$prof': unknown AGENT '$AGENT' (use claude|codex|copilot|none)" "$R"; return 1; }
   { [ "$force" = force ] && [ -n "$(pdroot "$alias")" ]; } && { aboxguard "$prof"; aboxdrop "$alias"; }
