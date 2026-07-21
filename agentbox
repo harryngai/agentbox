@@ -1,6 +1,6 @@
 #!/data/data/com.termux/files/usr/bin/bash
 # Version — single source of truth; the installer greps ^VERSION= (keep the line bare, no trailing comment).
-VERSION=3.3.2
+VERSION=3.3.3
 # agentbox — throwaway, folder-scoped AI-agent boxes for a phone (Android Termux + proot-distro ONLY).
 #
 # THREAT MODEL: this protects YOUR FILES from *accidents* (an agent touching the wrong folder), not from a hostile
@@ -521,7 +521,7 @@ rcsetup(){ has rclone || pkg install -y rclone || return 1
   rc config; }
 rcpair(){ printf '%s..%s' "$(printf '%s' "${PWD#/}" | tr '/ ' '__')" "$(printf '%s' "$RREMOTE:$1" | tr ':/ ' '___')"; }
 rcok(){ [ -z "${AB_RC_YES:-}" ] || return 0   # confirm once per run before syncing this dir (a mistake would sync the whole tree)
-  local a; printf 'sync %s ⇄ %s? [y/N] ' "$PWD" "$RREMOTE"; read -r a
+  local a; printf 'sync %s ⇄ %s:%s? [y/N] ' "$PWD" "$RREMOTE" "${1:-}"; read -r a
   case "$a" in [Yy]*) AB_RC_YES=1; return 0;; *) return 1;; esac; }
 rcsync(){ local p="${1:-}" mark
   [ -n "$p" ] || { msg "usage: ab sync <Dropbox path> [resync] | watch | setup | remove <path> | status" "$R"; return 1; }
@@ -529,7 +529,7 @@ rcsync(){ local p="${1:-}" mark
   rc listremotes 2>/dev/null | grep -q "^$RREMOTE:" || { msg "'$RREMOTE:' remote not configured — run 'ab sync setup' first" "$R"; return 1; }
   p="${p#"$HOME"/}"; p="${p#/}"; p="${p#"$RREMOTE":}"   # a ~/… path expands to $HOME/… in the shell → always treat as a Dropbox path
   [ -n "$p" ] || { msg "Dropbox path cannot be the root" "$R"; return 1; }
-  rcok || return 1
+  rcok "$p" || return 1
   [ -f "$RFILTER" ] || printf -- '- node_modules/**\n- .venv/**\n- __pycache__/**\n- .DS_Store\n' > "$RFILTER"
   mark="$STATE/bisync/$(rcpair "$p").ok"; mkdir -p "$STATE/bisync"
   local flags=(--config "$RCONF" --filters-file "$RFILTER" --conflict-resolve newer \
@@ -571,7 +571,7 @@ rcwatch(){ local s=300 p="" name
   while [ $# -gt 0 ]; do case "$1" in ''|*[!0-9]*) p="$1";; *) s="$1";; esac; shift; done
   [ -n "$p" ] || { msg "usage: ab sync watch <Dropbox path> [seconds, default 300]" "$R"; return 1; }
   [ "$s" -ge 10 ] 2>/dev/null || { msg "minimum interval 10s (each round hits the Dropbox API several times)" "$R"; return 1; }
-  rcok || return 1; needtmux || return 1; selfok || return 1
+  rcok "$p" || return 1; needtmux || return 1; selfok || return 1
   name="agentbox-sync-$(printf '%s' "${p##*/}" | tr -c 'A-Za-z0-9_.-' '_')"
   tmux has-session -t "=$name" 2>/dev/null && { msg "already watching — attach: ab session; stop: ab session kill ${name#agentbox-}" "$Y"; return 0; }
   [ "$(wakestat)" = on ] || wakeon || true
