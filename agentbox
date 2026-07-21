@@ -147,12 +147,22 @@ agent_recipe(){ local agent="${1:-none}" pkgs="${2:-}" gh=
     *) return 3;;
   esac
   [ -n "$gh" ] && cat <<'GH'
-apt-get install -y git
-mkdir -p /etc/apt/keyrings
-curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg -o /etc/apt/keyrings/githubcli-archive-keyring.gpg
-chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg
-echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" > /etc/apt/sources.list.d/github-cli.list
-apt-get update && apt-get install -y gh
+apt-get install -y git curl ca-certificates
+gharch=$(dpkg --print-architecture)
+case "$gharch" in
+  amd64|arm64)
+    mkdir -p /etc/apt/keyrings
+    curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg -o /etc/apt/keyrings/githubcli-archive-keyring.gpg
+    chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg
+    echo "deb [arch=$gharch signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" > /etc/apt/sources.list.d/github-cli.list
+    apt-get update && apt-get install -y gh ;;
+  *)  # no gh apt package for this arch (armhf/i386…) — install the release binary from GitHub
+    case "$gharch" in armhf) ga=armv6;; i386) ga=386;; *) ga=$gharch;; esac
+    gv=$(curl -fsSL https://api.github.com/repos/cli/cli/releases/latest | sed -n 's/.*"tag_name": *"v\{0,1\}\([^"]*\)".*/\1/p' | head -1)
+    curl -fsSL "https://github.com/cli/cli/releases/download/v${gv}/gh_${gv}_linux_${ga}.tar.gz" | tar -xz -C /tmp
+    install -m755 "/tmp/gh_${gv}_linux_${ga}/bin/gh" /usr/local/bin/gh
+    rm -rf "/tmp/gh_${gv}_linux_${ga}" ;;
+esac
 git config --system credential.https://github.com.helper '!gh auth git-credential'
 GH
   return 0; }
@@ -172,7 +182,7 @@ aboxbuild(){ local prof="$1" force="${2:-}" cf alias rootfs DIST="$DIST" \
   rootfs=$(pdroot "$alias"); [ -n "$rootfs" ] || { msg "box '$prof' rootfs not found" "$R"; return 1; }
   [ -n "$DESKTOP" ] && { msg "  DESKTOP → installing the desktop stack (minimal xfce + KasmVNC + chromium$([ "$APP" = code ] && echo ' + code-server'); heavy)…" "$Y"
     guiinstallscript "$rootfs/root/.gui-install.sh"; }
-  { printf '#!/bin/bash\nset -e\nexport DEBIAN_FRONTEND=noninteractive\napt-get update\napt-get install -y curl ca-certificates\n'
+  { printf '#!/bin/bash\nset -e\nexport DEBIAN_FRONTEND=noninteractive\ndpkg --configure -a 2>/dev/null || true\napt-get update\napt-get install -y curl ca-certificates\n'
     printf 'install-node(){ command -v node >/dev/null 2>&1 && return 0; curl -fsSL "https://deb.nodesource.com/setup_${1:-22}.x" | bash - ; apt-get install -y nodejs; }\n'
     [ -n "$INSTALL" ] && printf '%s\n' "$INSTALL"
     [ "$MITM" = 1 ] && printf 'apt-get install -y mitmproxy%s || { apt-get install -y python3-pip python3-venv libnss3-tools && pip3 install --break-system-packages mitmproxy; }\n' "$([ -n "$DESKTOP" ] && printf ' libnss3-tools')"
