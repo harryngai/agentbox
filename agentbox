@@ -1,6 +1,6 @@
 #!/data/data/com.termux/files/usr/bin/bash
 # Version — single source of truth; the installer greps ^VERSION= (keep the line bare, no trailing comment).
-VERSION=3.2.0
+VERSION=3.2.1
 # agentbox — throwaway, folder-scoped AI-agent boxes for a phone (Android Termux + proot-distro ONLY).
 #
 # THREAT MODEL: this protects YOUR FILES from *accidents* (an agent touching the wrong folder), not from a hostile
@@ -581,6 +581,8 @@ link(){ local b n; b=$(bindir); mkdir -p "$b"
     && msg "note: 'ab' already resolves to $(command -v ab) (apache bench?); the agentbox 'ab' link may shadow it depending on PATH order" "$Y"
   for n in agentbox ab; do ln -sf "$SELF" "$b/$n"; done
   msg "linked $b/{agentbox,ab} → $SELF" "$G"; }
+# True when both ab + agentbox already point at this script — lets the guided-setup links step auto-skip.
+linked(){ local b; b=$(bindir); [ "$(readlink -f "$b/ab" 2>/dev/null)" = "$SELF" ] && [ "$(readlink -f "$b/agentbox" 2>/dev/null)" = "$SELF" ]; }
 
 # ── First-time phone setup (font / extra-keys / sshd / unkill) ─────
 # Terminal font: without a custom font Termux lacks powerline/box glyphs and renders the extra-key labels as tofu.
@@ -673,7 +675,7 @@ unkill(){ local t="${AGENTBOX_TTY:-/dev/tty}" pport cport code v
 # ── Guided first-time setup (ab setup) — bootstrap the tool + edit tokens (env folded in) ──
 setup(){ local t="${AGENTBOX_TTY:-/dev/tty}" ans i=0 tot cmd title why rest s; local -a steps
   steps=(
-    "links|put agentbox on PATH|Creates the ab / agentbox commands in \$PREFIX/bin (skip if the installer already did it)."
+    "links|put agentbox on PATH|Creates the ab / agentbox commands in \$PREFIX/bin (only runs if they're missing)."
     "init|set up Termux|Glyph font + extra-keys row (⇧⇥/arrows), updates Termux, installs proot-distro, and starts sshd on 8022."
     "tmux|tmux config|Applies the managed tmux config (mouse off + TUI-friendly keys)."
     "unkill|stop Android killing the box|Disables the phantom-process killer via on-device adb (Android 12+, guided)."
@@ -684,6 +686,7 @@ setup(){ local t="${AGENTBOX_TTY:-/dev/tty}" ans i=0 tot cmd title why rest s; l
   for s in "${steps[@]}"; do
     i=$((i+1)); cmd="${s%%|*}"; rest="${s#*|}"; title="${rest%%|*}"; why="${rest#*|}"
     printf '\n' > "$t"; msg "Step $i of $tot — $title" "$G"
+    if [ "$cmd" = links ] && linked; then msg "  already on PATH → skipping (the installer and 'set up Termux' both link)" "$Y"; continue; fi
     printf '%s\n' "$why" > "$t"
     printf 'Enter = run;  n = skip: ' > "$t"
     IFS= read -r ans < "$t" || ans=n
