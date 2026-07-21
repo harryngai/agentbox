@@ -59,7 +59,7 @@ fi
 TPLDIR="$(dirname "$DEST")/templates"
 mkdir -p "$TPLDIR"
 tpl_ok=1
-for t in main claude codex copilot shell web; do
+for t in claude codex copilot shell web; do
   if fetch "$BASE/templates/$t.conf" "$TPLDIR/$t.conf" \
      && head -1 "$TPLDIR/$t.conf" | grep -q '^# agentbox box profile'; then :
   else err "  template '$t' failed or looks wrong (404/HTML?)"; rm -f "$TPLDIR/$t.conf"; tpl_ok=; fi
