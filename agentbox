@@ -1,6 +1,6 @@
 #!/data/data/com.termux/files/usr/bin/bash
 # Version — single source of truth; the installer greps ^VERSION= (keep the line bare, no trailing comment).
-VERSION=3.3.3
+VERSION=3.4.0
 # agentbox — throwaway, folder-scoped AI-agent boxes for a phone (Android Termux + proot-distro ONLY).
 #
 # THREAT MODEL: this protects YOUR FILES from *accidents* (an agent touching the wrong folder), not from a hostile
@@ -566,11 +566,38 @@ rcremove(){ local p="${1:-}" base rkey f n=0
     rm -f "${f%.ok}".*; n=$((n+1)); done
   [ "$n" -gt 0 ] || { msg "no state for $RREMOTE:$p in any folder — see 'ab sync' for the exact pairs" "$Y"; return 1; }
   return 0; }
+# Emit "localdir<TAB>remotepath" for every recorded pair, parsed from each .ok mark's stored "~/local ⇄ dropbox:remote".
+rcpairs(){ local f line l r
+  for f in "$STATE/bisync"/*.ok; do [ -s "$f" ] || continue
+    line=$(head -1 "$f"); case "$line" in *" ⇄ "*) :;; *) continue;; esac
+    l=${line%% ⇄ *}; r=${line##* ⇄ }; l="${l/#\~/$HOME}"; r="${r#*:}"   # ~→$HOME, strip "dropbox:"
+    [ -n "$l" ] && [ -n "$r" ] && printf '%s\t%s\n' "$l" "$r"; done; }
+# Sync every recorded pair once, each from its own local dir. AB_RC_YES must already be set (the loop/caller confirms first).
+rcsyncall(){ local l r n=0 rc=0
+  while IFS=$'\t' read -r l r; do
+    [ -d "$l" ] || { msg "skip: $(short "$l") no longer exists (ab sync remove $r)" "$Y"; continue; }
+    n=$((n+1)); msg "── $(short "$l") ⇄ $RREMOTE:$r ──" "$CY"
+    ( cd "$l" && rcsync "$r" ) || rc=1
+  done < <(rcpairs)
+  [ "$n" -gt 0 ] || { msg "no sync pairs — create one: ab sync <Dropbox path>" "$Y"; return 1; }
+  return "$rc"; }
 # Minimal watch: open a host tmux session (agentbox-sync-<x>) looping bisync in the background. Attach/kill via ab session.
+# No path → watch every recorded pair in one 'sync-all' session.
 rcwatch(){ local s=300 p="" name
   while [ $# -gt 0 ]; do case "$1" in ''|*[!0-9]*) p="$1";; *) s="$1";; esac; shift; done
-  [ -n "$p" ] || { msg "usage: ab sync watch <Dropbox path> [seconds, default 300]" "$R"; return 1; }
   [ "$s" -ge 10 ] 2>/dev/null || { msg "minimum interval 10s (each round hits the Dropbox API several times)" "$R"; return 1; }
+  if [ -z "$p" ]; then                          # watch-all
+    local pairs; pairs=$(rcpairs)
+    [ -n "$pairs" ] || { msg "no sync pairs to watch — create one first: ab sync <Dropbox path>" "$R"; return 1; }
+    printf '%s\n' "$pairs" | while IFS=$'\t' read -r l r; do printf '  %s ⇄ %s:%s\n' "$(short "$l")" "$RREMOTE" "$r"; done
+    local a; printf 'watch all the above every %ss? [y/N] ' "$s"; read -r a
+    case "$a" in [Yy]*) :;; *) return 1;; esac
+    needtmux || return 1; selfok || return 1
+    name="agentbox-sync-all"
+    tmux has-session -t "=$name" 2>/dev/null && { msg "already watching all — attach: ab session; stop: ab session kill sync-all" "$Y"; return 0; }
+    [ "$(wakestat)" = on ] || wakeon || true
+    tmux new -ds "$name" bash "$SELF" sync watch-run-all "$s"
+    msg "watching all pairs every ${s}s (session sync-all); stop: ab session kill sync-all" "$G"; return 0; fi
   rcok "$p" || return 1; needtmux || return 1; selfok || return 1
   name="agentbox-sync-$(printf '%s' "${p##*/}" | tr -c 'A-Za-z0-9_.-' '_')"
   tmux has-session -t "=$name" 2>/dev/null && { msg "already watching — attach: ab session; stop: ab session kill ${name#agentbox-}" "$Y"; return 0; }
@@ -579,6 +606,8 @@ rcwatch(){ local s=300 p="" name
   msg "watching $RREMOTE:$p every ${s}s (session ${name#agentbox-}); stop: ab session kill ${name#agentbox-}" "$G"; }
 rcwatchrun(){ local s="$1" p="$2"; AB_RC_YES=1   # internal: the loop run inside the session pane
   while :; do rcsync "$p" || msg "this round failed, retrying in ${s}s" "$Y"; sleep "$s"; done; }
+rcwatchrunall(){ local s="$1"; AB_RC_YES=1        # internal: the sync-all loop run inside the session pane
+  while :; do rcsyncall || msg "some pairs failed this round, retrying in ${s}s" "$Y"; sleep "$s"; done; }
 
 # ── Command links (agentbox / ab on PATH) ──────────────────────────
 bindir(){ echo "$PREFIX/bin"; }
@@ -735,7 +764,7 @@ usage(){
   hd "▍Sync  ${DM}(rclone bisync, manual trigger)${Z}"
   row sync    "[path]"    "sync cwd ⇄ ${RREMOTE}:<path> (no arg = status)"
   row "sync setup" ""     "install rclone + configure the remote"
-  row "sync watch" "[sec] [path]" "loop-sync in a background session (default 300s)"
+  row "sync watch" "[sec] [path]" "loop-sync in a background session (default 300s; no path = all pairs)"
   row "sync remove" "[path]" "delete a pair's sync state"
   hd "▍Tool"
   row setup   ""          "guided bootstrap — links · font · keys · tmux · unkill · proot · tokens (re-runnable)"
@@ -764,6 +793,7 @@ case "${1:-}" in
       remove) shift; rcremove "$@";;
       watch) shift; rcwatch "$@";;
       watch-run) shift; rcwatchrun "$@";;         # internal: the loop run inside a session pane
+      watch-run-all) shift; rcwatchrunall "$@";;  # internal: the sync-all loop run inside a session pane
       ""|status) rcstatus;;
       *) rcsync "$@";; esac;;
   session) shift; session "$@";;
