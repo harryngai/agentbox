@@ -1,6 +1,6 @@
 #!/data/data/com.termux/files/usr/bin/bash
 # Version — single source of truth; the installer greps ^VERSION= (keep the line bare, no trailing comment).
-VERSION=3.9.0
+VERSION=3.9.1
 # agentbox — throwaway, folder-scoped AI-agent boxes for a phone (Android Termux + proot-distro ONLY).
 #
 # THREAT MODEL: this protects YOUR FILES from *accidents* (an agent touching the wrong folder), not from a hostile
