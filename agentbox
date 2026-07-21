@@ -1,6 +1,6 @@
 #!/data/data/com.termux/files/usr/bin/bash
 # Version — single source of truth; the installer greps ^VERSION= (keep the line bare, no trailing comment).
-VERSION=3.3.1
+VERSION=3.3.2
 # agentbox — throwaway, folder-scoped AI-agent boxes for a phone (Android Termux + proot-distro ONLY).
 #
 # THREAT MODEL: this protects YOUR FILES from *accidents* (an agent touching the wrong folder), not from a hostile
@@ -710,8 +710,9 @@ setup(){ local t="${AGENTBOX_TTY:-/dev/tty}" ans i=0 tot cmd title why rest s; l
 # may cache the branch URL for up to ~5 min, so an update right after a fresh push can briefly lag — re-run it if so.
 update(){ { has curl || has wget; } || { msg "need curl or wget to update" "$R"; return 1; }
   msg "re-running the installer ($AGBASE/install.sh)…" "$Y"
-  if has curl; then curl -fsSL "$AGBASE/install.sh" | AGENTBOX_BASE="$AGBASE" bash
-  else wget -qO- "$AGBASE/install.sh" | AGENTBOX_BASE="$AGBASE" bash; fi; }
+  # AGENTBOX_SKIP_SETUP=1 → refresh code+templates only; skip the guided setup (run 'ab setup' to reconfigure).
+  if has curl; then curl -fsSL "$AGBASE/install.sh" | AGENTBOX_BASE="$AGBASE" AGENTBOX_SKIP_SETUP=1 bash
+  else wget -qO- "$AGBASE/install.sh" | AGENTBOX_BASE="$AGBASE" AGENTBOX_SKIP_SETUP=1 bash; fi; }
 
 # ── Help screen ────────────────────────────────────────────────────
 row(){ local n=$((30-$(dw "$1${2:+ $2}"))); ((n<1)) && n=1
@@ -738,7 +739,7 @@ usage(){
   row "sync remove" "[path]" "delete a pair's sync state"
   hd "▍Tool"
   row setup   ""          "guided bootstrap — links · font · keys · tmux · unkill · proot · tokens (re-runnable)"
-  row update  ""          "re-run the installer to pull the latest version"
+  row update  ""          "pull the latest version (code + templates only — run setup to reconfigure)"
   row help    ""          "this screen          (ab version = version)"
   printf '\n%s\n' "${DM}profile $(short "$VC")/box-<name>.conf — simple: AGENT(claude|codex|copilot|none)·PKGS·TOKENS·RUN·MOUNT(cwd|none)·EPHEMERAL(0|1)·DESKTOP(xfce)·APP(code|browser)·MITM(0|1)·DIST(base distro);  docker: set INSTALL='…' for raw build steps${Z}"
   printf '%s\n' "${DM}tokens live in $(short "$ENVF") (0600; only a profile's TOKENS keys are injected; AGENTBOX_* excluded)${Z}"

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# agentbox installer — v3.3.1 (version stamp only: this always pulls the latest agentbox from main).
+# agentbox installer — v3.3.2 (version stamp only: this always pulls the latest agentbox from main).
 #   curl -fsSL https://raw.githubusercontent.com/harryngai/agentbox/main/install.sh | bash
 # Downloads the agentbox script, makes it executable, and links `agentbox` + `ab` onto your PATH.
 # Safe to re-run any time — it just pulls the latest version (so this doubles as an updater).
@@ -9,6 +9,7 @@
 #   AGENTBOX_BASE=<raw base url>   (default: the GitHub repo below — point it at your fork/host)
 #   AGENTBOX_URL=<direct url to agentbox>
 #   AGENTBOX_BIN=<where to put the real script>   (default: ~/.local/share/agentbox/agentbox)
+#   AGENTBOX_SKIP_SETUP=1   refresh code+templates only, skip the guided setup (what `ab update` passes)
 set -euo pipefail
 
 BASE="${AGENTBOX_BASE:-https://raw.githubusercontent.com/harryngai/agentbox/main}"
@@ -72,7 +73,10 @@ say "done — $(bash "$DEST" version 2>/dev/null || echo agentbox)"
 # ── Guided first-time setup ────────────────────────────────────────────────────
 # Delegate to `ab setup` (defined in agentbox: links → Termux init → tmux → unkill → tokens).
 # This script arrives over a pipe (curl | bash), so hand the child its tty via /dev/tty.
-if [ -t 1 ] && [ -r /dev/tty ]; then
+# `ab update` sets AGENTBOX_SKIP_SETUP=1 so an update refreshes code only and never re-walks setup.
+if [ -n "${AGENTBOX_SKIP_SETUP:-}" ]; then
+  printf '\n'; say "updated — config left untouched. Run 'ab setup' to (re)configure the environment."
+elif [ -t 1 ] && [ -r /dev/tty ]; then
   printf '\n'; say "agentbox is installed — starting guided setup."
   bash "$DEST" setup < /dev/tty
 else
