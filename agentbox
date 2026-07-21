@@ -1,6 +1,6 @@
 #!/data/data/com.termux/files/usr/bin/bash
 # Version — single source of truth; the installer greps ^VERSION= (keep the line bare, no trailing comment).
-VERSION=3.2.1
+VERSION=3.2.2
 # agentbox — throwaway, folder-scoped AI-agent boxes for a phone (Android Termux + proot-distro ONLY).
 #
 # THREAT MODEL: this protects YOUR FILES from *accidents* (an agent touching the wrong folder), not from a hostile
@@ -527,7 +527,7 @@ rcsync(){ local p="${1:-}" mark
   [ -n "$p" ] || { msg "usage: ab sync <Dropbox path> [resync] | watch | setup | remove <path> | status" "$R"; return 1; }
   has rclone || rcsetup || return 1
   rc listremotes 2>/dev/null | grep -q "^$RREMOTE:" || { msg "'$RREMOTE:' remote not configured — run 'ab sync setup' first" "$R"; return 1; }
-  p="${p#"$HOME"/}"; p="${p#/}"   # a ~/… path expands to $HOME/… in the shell → always treat as a Dropbox path
+  p="${p#"$HOME"/}"; p="${p#/}"; p="${p#"$RREMOTE":}"   # a ~/… path expands to $HOME/… in the shell → always treat as a Dropbox path
   [ -n "$p" ] || { msg "Dropbox path cannot be the root" "$R"; return 1; }
   rcok || return 1
   [ -f "$RFILTER" ] || printf -- '- node_modules/**\n- .venv/**\n- __pycache__/**\n- .DS_Store\n' > "$RFILTER"
@@ -554,11 +554,18 @@ rcstatus(){ local f n=0 w
   w=$(tmux ls -F '#S' 2>/dev/null | grep '^agentbox-sync-' | sed 's/^agentbox-sync-/  watching: /')
   [ -n "$w" ] && printf '%s\n' "$w"
   [ "$n" -eq 0 ] && msg "no sync pairs — create one: ab sync <Dropbox path>" "$Y"; return 0; }
-rcremove(){ local p="${1:-}" base
+rcremove(){ local p="${1:-}" base rkey f n=0
   [ -n "$p" ] || { msg "usage: ab sync remove <Dropbox path>" "$Y"; return 1; }
-  p="${p#"$HOME"/}"; p="${p#/}"; base="$STATE/bisync/$(rcpair "$p")"
-  ls "$base".* >/dev/null 2>&1 || { msg "no state for $(short "$PWD") ⇄ $RREMOTE:$p" "$Y"; return 1; }
-  rm -f "$base".*; msg "pair state deleted (next sync auto-resyncs)" "$G"; }
+  p="${p#"$HOME"/}"; p="${p#/}"; p="${p#"$RREMOTE":}"   # accept ~/…, /…, or dropbox:… forms
+  base="$STATE/bisync/$(rcpair "$p")"                    # 1) exact pair for THIS folder
+  if ls "$base".* >/dev/null 2>&1; then rm -f "$base".*
+    msg "pair state deleted: $(short "$PWD") ⇄ $RREMOTE:$p (next sync auto-resyncs)" "$G"; return 0; fi
+  rkey=$(printf '%s' "$RREMOTE:$p" | tr ':/ ' '___')     # 2) else match the remote path in whatever folder made it
+  for f in "$STATE/bisync/"*"..$rkey.ok"; do [ -e "$f" ] || continue
+    if [ -s "$f" ]; then msg "removed $(cat "$f") (next sync auto-resyncs)" "$G"; else msg "removed $(basename "$f" .ok)" "$G"; fi
+    rm -f "${f%.ok}".*; n=$((n+1)); done
+  [ "$n" -gt 0 ] || { msg "no state for $RREMOTE:$p in any folder — see 'ab sync' for the exact pairs" "$Y"; return 1; }
+  return 0; }
 # Minimal watch: open a host tmux session (agentbox-sync-<x>) looping bisync in the background. Attach/kill via ab session.
 rcwatch(){ local s=300 p="" name
   while [ $# -gt 0 ]; do case "$1" in ''|*[!0-9]*) p="$1";; *) s="$1";; esac; shift; done
