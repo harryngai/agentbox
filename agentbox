@@ -1,6 +1,6 @@
 #!/data/data/com.termux/files/usr/bin/bash
 # Version — single source of truth; the installer greps ^VERSION= (keep the line bare, no trailing comment).
-VERSION=3.4.1
+VERSION=3.5.0
 # agentbox — throwaway, folder-scoped AI-agent boxes for a phone (Android Termux + proot-distro ONLY).
 #
 # THREAT MODEL: this protects YOUR FILES from *accidents* (an agent touching the wrong folder), not from a hostile
@@ -107,7 +107,7 @@ envedit(){ mkenv
 # ONLY the tokens TOKENS lists. `ab <name>` from a folder builds the box if missing and runs it there. Profiles are just
 # files: your editable copy at $VC/box-<name>.conf, seeded from $TPL/<name>.conf (or a built-in claude profile if none).
 aboxconf(){ echo "$VC/box-$1.conf"; }
-aboxalias(){ echo "agentbox-$1"; }   # every proot container / tmux session is prefixed agentbox-
+aboxalias(){ echo "agentbox-$1"; }   # proot container prefix (agentbox-<name>); tmux sessions use the shorter ab- prefix
 aboxtemplates(){ local f b out=; for f in "$TPL"/*.conf; do [ -e "$f" ] || break
     b=$(basename "$f" .conf); out="$out $b"; done; echo "${out# }"; }
 # In-box bind/cd target: a unique /work-<kebab(cwd)> per host folder (only [a-z0-9-], so it is always shell-safe).
@@ -192,10 +192,10 @@ aboxbuild(){ local prof="$1" force="${2:-}" cf alias rootfs DIST="$DIST" \
   [ -f "$rootfs/root/.claude/.claude.json" ] || printf '{"hasCompletedOnboarding": true}\n' > "$rootfs/root/.claude/.claude.json"
   if proot-distro login "$alias" -- bash /root/.abbuild.sh; then rm -f "$rootfs/root/.abbuild.sh" "$rootfs/root/.gui-install.sh"; msg "box '$prof' ready" "$G"
   else rm -f "$rootfs/root/.abbuild.sh" "$rootfs/root/.gui-install.sh"; msg "build failed for '$prof' (see output above)" "$R"; return 1; fi; }
-# Stop the running box desktop (session agentbox-boxgui); a throwaway (EPHEMERAL=1) desktop box is deleted on stop so
+# Stop the running box desktop (session ab-boxgui); a throwaway (EPHEMERAL=1) desktop box is deleted on stop so
 # its next launch is genuinely fresh (this is where EPHEMERAL is honoured for desktop boxes).
 aboxguistop(){ local prof; prof=$(cat "$STATE/boxgui.prof" 2>/dev/null)
-  tmux kill-session -t "=agentbox-boxgui" 2>/dev/null; rm -f "$STATE/boxgui.prof"
+  tmux kill-session -t "=ab-boxgui" 2>/dev/null; rm -f "$STATE/boxgui.prof"
   if [ -n "$prof" ]; then local cf INSTALL TOKENS RUN MOUNT EPHEMERAL=0 DESKTOP APP MITM AGENT PKGS DIST
     cf=$(aboxconf "$prof"); [ -f "$cf" ] && . "$cf"
     [ "$EPHEMERAL" = 1 ] && aboxdrop "$(aboxalias "$prof")" && msg "throwaway box '$prof' deleted — next launch is fresh" "$Y"; fi
@@ -203,17 +203,17 @@ aboxguistop(){ local prof; prof=$(cat "$STATE/boxgui.prof" 2>/dev/null)
 # If <prof>'s desktop is the one currently running, stop it before we delete/rebuild its rootfs (proot is userspace —
 # rm -rf under a live session would corrupt it and orphan the session + wakelock).
 aboxguard(){ [ -f "$STATE/boxgui.prof" ] && [ "$(cat "$STATE/boxgui.prof" 2>/dev/null)" = "$1" ] \
-    && tmux has-session -t "=agentbox-boxgui" 2>/dev/null \
+    && tmux has-session -t "=ab-boxgui" 2>/dev/null \
     && { msg "stopping box '$1's running desktop first…" "$Y"; aboxguistop; }; return 0; }
 # Scoped desktop for a DESKTOP=xfce box: KasmVNC + (code-server for APP=code, or chromium for APP=browser) inside the
-# box. Own ports (6902/8081, localhost); one box desktop at a time (session agentbox-boxgui). Fresh random password each
+# box. Own ports (6902/8081, localhost); one box desktop at a time (session ab-boxgui). Fresh random password each
 # start, printed. MOUNT=none binds nothing (SEALED); otherwise the cwd opens as /work-<cwd>. MITM=1 routes chromium
 # through mitmweb (CA trusted into the box's nssdb, proxy flag added).
 aboxgui(){ local prof="$1" alias="$2" rootfs="$3" app="${4:-code}" mnt="${5:-cwd}" mitm="${6:-0}" pw tgt geo
   needtmux || return 1
   { [ -x "$rootfs/usr/bin/startxfce4" ] && [ -d "$rootfs/usr/share/kasmvnc" ]; } \
     || { msg "the desktop stack isn't in box '$prof' yet — rebuild it: ab remove $prof && ab $prof" "$Y"; return 1; }
-  tmux has-session -t "=agentbox-boxgui" 2>/dev/null \
+  tmux has-session -t "=ab-boxgui" 2>/dev/null \
     && { msg "a box desktop is already running (one at a time) — stop it: ab remove $prof" "$Y"; return 1; }
   pw=$(gui_randpw)
   mkdir -p "$rootfs/root/.vnc" "$rootfs/root/.config/code-server"
@@ -261,12 +261,12 @@ EOS
   # Launch via bash -c '…"$2"…' _ "$alias" "$PWD" "$tgt": the host path arrives as argv, expanded once, so any
   # space/$/quote/backtick in it stays literal (no re-parsed launch-script path).
   if [ "$mnt" = none ]; then
-    tmux new -ds agentbox-boxgui bash -c 'exec proot-distro login "$1" --isolated -- bash /root/.boxgui-run.sh' _ "$alias"
+    tmux new -ds ab-boxgui bash -c 'exec proot-distro login "$1" --isolated -- bash /root/.boxgui-run.sh' _ "$alias"
   else
-    tmux new -ds agentbox-boxgui bash -c 'exec proot-distro login "$1" --isolated --bind "$2:$3" -- bash /root/.boxgui-run.sh' _ "$alias" "$PWD" "$tgt"
+    tmux new -ds ab-boxgui bash -c 'exec proot-distro login "$1" --isolated --bind "$2:$3" -- bash /root/.boxgui-run.sh' _ "$alias" "$PWD" "$tgt"
   fi
   sleep 3
-  tmux has-session -t "=agentbox-boxgui" 2>/dev/null \
+  tmux has-session -t "=ab-boxgui" 2>/dev/null \
     || { msg "box desktop exited immediately — rebuild the box: ab remove $prof && ab $prof" "$R"; return 1; }
   mkdir -p "$STATE"; printf '%s' "$prof" > "$STATE/boxgui.prof"
   [ "$mnt" = none ] && msg "box desktop '$prof' started — SEALED (no folder bound):" "$G" \
@@ -278,19 +278,17 @@ EOS
   kv "  password (both)" "$pw" "$G"
   msg "  stop / drop the box: ab remove $prof" "$Y"; return 0; }
 # `ab <name> [cmd]` — build box <name> from its profile if missing, then run it scoped to the cwd.
-abox(){ local prof="$1"; shift; local newsess=
-  case "${1:-}" in -n|--new) newsess=1; shift;; esac   # -n/--new → an extra session for this folder (default re-attaches)
-  local cmd="$*" cf alias rootfs \
+abox(){ local prof="$1"; shift; local cmd="$*" cf alias rootfs \
     INSTALL= TOKENS= RUN= MOUNT=cwd EPHEMERAL=0 DESKTOP= APP=code MITM=0 AGENT= PKGS= DIST= ef efn rc tgt run incmd mitmblock= ms=
   cf=$(aboxconf "$prof"); alias=$(aboxalias "$prof")
   has proot-distro || pkg install -y proot-distro || { msg "proot-distro install failed" "$R"; return 1; }
   [ -f "$cf" ] || { mkdir -p "$VC"; aboxdefault "$cf" "$prof" || return 1
     msg "new profile $(short "$cf") — binds only the launch folder, injects only its tokens (edit it directly)" "$Y"; }
   . "$cf"; mkenv
-  # Auto-session: an interactive, command-less CLI box runs inside a per-folder tmux session (survives ssh-drop; two
-  # folders → two sessions). Explicit cmd / piped output / already in tmux / desktop box → foreground. Off: AB_NO_SESSION=1.
+  # Auto-session: an interactive, command-less CLI box opens a fresh tmux session each launch (survives ssh-drop;
+  # reattach earlier ones with 'ab session'). Explicit cmd / piped output / in tmux / desktop box → foreground. Off: AB_NO_SESSION=1.
   if [ -z "$DESKTOP" ] && [ -z "$cmd" ] && [ -t 1 ] && [ -z "${TMUX:-}" ] && [ "${AB_NO_SESSION:-}" != 1 ]; then
-    sessrun "$newsess" "$prof"; return $?
+    sessrun "$prof"; return $?
   fi
   # Build when missing; a non-desktop EPHEMERAL box rebuilds fresh each run (desktop boxes only when missing — too heavy).
   if { [ -z "$DESKTOP" ] && [ "$EPHEMERAL" = 1 ]; } || [ -z "$(pdroot "$alias")" ]; then
@@ -476,7 +474,7 @@ tmuxconf(){ local f=~/.tmux.conf force="${1:-}"
   [ "$force" != force ] || msg "tmux config applied → $f (mouse off, passthrough, extended keys; first run backs up to $f.bak)" "$G"
   return 0; }
 needtmux(){ has tmux || pkg install -y tmux || { msg "tmux is required but not available" "$R"; return 1; }; tmuxconf; }
-anysession(){ tmux ls -F '#S' 2>/dev/null | grep -q '^agentbox-'; }
+anysession(){ tmux ls -F '#S' 2>/dev/null | grep -q '^ab-'; }
 # A session pane re-runs `bash "$SELF" …`; if the on-disk script won't parse, the pane dies the instant it starts —
 # after we've grabbed the wakelock. Check first: fail loud, print the real parser message, don't touch the lock.
 selfok(){ local e; e=$(bash -n "$SELF" 2>&1) && return 0
@@ -485,31 +483,33 @@ selfok(){ local e; e=$(bash -n "$SELF" 2>&1) && return 0
 # List/pick agentbox tmux sessions to reattach (mode=enter) or kill (mode=kill).
 sesspick(){ local mode="${1:-enter}" names=() n path i=1 c
   while IFS=$'\t' read -r n path; do [ -n "$n" ] || continue; names+=("$n")
-      printf '  %s) %s%s\n' "$i" "${n#agentbox-}" "${path:+  $(short "$path")}"; i=$((i+1)); done \
-    < <(tmux ls -F "#S"$'\t'"#{pane_current_path}" 2>/dev/null | grep '^agentbox-')
+      printf '  %s) %s%s\n' "$i" "${n#ab-}" "${path:+  $(short "$path")}"; i=$((i+1)); done \
+    < <(tmux ls -F "#S"$'\t'"#{pane_current_path}" 2>/dev/null | grep '^ab-')
   [ ${#names[@]} -eq 0 ] && { msg "no agentbox sessions — open one: ab session <name>" "$Y"; return 0; }
   printf '%s which? [1-%s, q=cancel] ' "$([ "$mode" = kill ] && echo kill || echo reattach)" "${#names[@]}"; read -r c
   case "$c" in ''|q|Q) return 0;; *[!0-9]*) msg "enter a number" "$R"; return 1;; esac
   { [ "$c" -ge 1 ] && [ "$c" -le ${#names[@]} ]; } || { msg "out of range" "$R"; return 1; }
   n="${names[$((c-1))]}"
-  if [ "$mode" = kill ]; then tmux kill-session -t "=$n" 2>/dev/null; msg "session '${n#agentbox-}' killed" "$G"
+  if [ "$mode" = kill ]; then tmux kill-session -t "=$n" 2>/dev/null; msg "session '${n#ab-}' killed" "$G"
   else needtmux || return 1; tmux attach -t "=$n"; fi
   anysession || { [ "$(wakestat)" = on ] && wakeoff; }; return 0; }
-# A per-folder session tag so two folders running the same box get two sessions (re-attach stays deterministic).
-sesstag(){ printf '%s' "$PWD" | cksum | cut -d' ' -f1; }
-# Open/reattach a persistent session (agentbox-<name>-<folder>) running box <name> here (survives ssh drop / app switch).
-# new (arg 1) non-empty → don't reattach; open an ADDITIONAL numbered session (-2, -3, …) for this same folder.
-sessrun(){ local new="$1" prof="$2"; shift 2; local s base i=2; base="$(aboxalias "$prof")-$(sesstag)"; s="$base"
+# Simplified kebab-case of a path's last component (or a box name): lowercase, non-alnum → '-', collapsed/trimmed.
+slug(){ local s; s=$(printf '%s' "${1##*/}" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9' '-' | sed 's/-\{2,\}/-/g; s/^-//; s/-$//'); printf '%s' "${s:-x}"; }
+# Open a FRESH session (ab-<box>-<folder>-<rand>) running box <name> here (survives ssh drop / app switch).
+# Always new — each launch gets its own; a random suffix keeps same-folder launches distinct. Reattach with 'ab session'.
+sessrun(){ local prof="$1"; shift; local s base
   needtmux || return 1; selfok || return 1
   [ "$(wakestat)" = on ] || wakeon || true
-  [ -n "$new" ] && while tmux has-session -t "=$s" 2>/dev/null; do s="$base-$i"; i=$((i+1)); done
-  tmux new -As "$s" -c "$PWD" bash "$SELF" "$prof" "$@"
+  base="ab-$(slug "$prof")-$(slug "$PWD")"
+  s="$base-$(printf '%04d' "$((RANDOM % 10000))")"
+  while tmux has-session -t "=$s" 2>/dev/null; do s="$base-$(printf '%04d' "$((RANDOM % 10000))")"; done
+  tmux new -s "$s" -c "$PWD" bash "$SELF" "$prof" "$@"
   anysession || { [ "$(wakestat)" = on ] && wakeoff; }; return 0; }
 session(){ local k n; case "${1:-}" in
     ""|ls|list) sesspick;;
     kill) shift
       if [ -n "${1:-}" ]; then n=0
-        for k in $(tmux ls -F '#S' 2>/dev/null | grep -E "^agentbox-$1(-|\$)"); do
+        for k in $(tmux ls -F '#S' 2>/dev/null | grep -E "^ab-$1(-|\$)"); do
           tmux kill-session -t "=$k" 2>/dev/null && n=$((n+1)); done
         [ "$n" -gt 0 ] && msg "killed $n session(s) for '$1'" "$G" || msg "no session for '$1'" "$Y"
         anysession || { [ "$(wakestat)" = on ] && wakeoff; }
@@ -555,7 +555,7 @@ rcstatus(){ local f n=0 w
   for f in "$STATE/bisync"/*.ok; do [ -e "$f" ] || break; n=$((n+1))
     if [ -s "$f" ]; then printf '  %s' "$(cat "$f")"; else printf '  %s' "$(basename "$f" .ok)"; fi
     printf '  (last: %s)\n' "$(date -r "$f" '+%m-%d %H:%M')"; done
-  w=$(tmux ls -F '#S' 2>/dev/null | grep '^agentbox-sync-' | sed 's/^agentbox-sync-/  watching: /')
+  w=$(tmux ls -F '#S' 2>/dev/null | grep '^ab-sync-' | sed 's/^ab-sync-/  watching: /')
   [ -n "$w" ] && printf '%s\n' "$w"
   [ "$n" -eq 0 ] && msg "no sync pairs — create one: ab sync <Dropbox path>" "$Y"; return 0; }
 rcremove(){ local p="${1:-}" base rkey f n=0
@@ -585,7 +585,7 @@ rcsyncall(){ local l r n=0 rc=0
   done < <(rcpairs)
   [ "$n" -gt 0 ] || { msg "no sync pairs — create one: ab sync <Dropbox path>" "$Y"; return 1; }
   return "$rc"; }
-# Minimal watch: open a host tmux session (agentbox-sync-<x>) looping bisync in the background. Attach/kill via ab session.
+# Minimal watch: open a host tmux session (ab-sync-<x>) looping bisync in the background. Attach/kill via ab session.
 # No path → watch every recorded pair in one 'sync-all' session.
 rcwatch(){ local s=300 p="" name
   while [ $# -gt 0 ]; do case "$1" in ''|*[!0-9]*) p="$1";; *) s="$1";; esac; shift; done
@@ -597,17 +597,17 @@ rcwatch(){ local s=300 p="" name
     local a; printf 'watch all the above every %ss? [y/N] ' "$s"; read -r a
     case "$a" in [Yy]*) :;; *) return 1;; esac
     needtmux || return 1; selfok || return 1
-    name="agentbox-sync-all"
+    name="ab-sync-all"
     tmux has-session -t "=$name" 2>/dev/null && { msg "already watching all — attach: ab session; stop: ab session kill sync-all" "$Y"; return 0; }
     [ "$(wakestat)" = on ] || wakeon || true
     tmux new -ds "$name" bash "$SELF" sync watch-run-all "$s"
     msg "watching all pairs every ${s}s (session sync-all); stop: ab session kill sync-all" "$G"; return 0; fi
   rcok "$p" || return 1; needtmux || return 1; selfok || return 1
-  name="agentbox-sync-$(printf '%s' "${p##*/}" | tr -c 'A-Za-z0-9_.-' '_')"
-  tmux has-session -t "=$name" 2>/dev/null && { msg "already watching — attach: ab session; stop: ab session kill ${name#agentbox-}" "$Y"; return 0; }
+  name="ab-sync-$(printf '%s' "${p##*/}" | tr -c 'A-Za-z0-9_.-' '_')"
+  tmux has-session -t "=$name" 2>/dev/null && { msg "already watching — attach: ab session; stop: ab session kill ${name#ab-}" "$Y"; return 0; }
   [ "$(wakestat)" = on ] || wakeon || true
   tmux new -ds "$name" -c "$PWD" bash "$SELF" sync watch-run "$s" "$p"
-  msg "watching $RREMOTE:$p every ${s}s (session ${name#agentbox-}); stop: ab session kill ${name#agentbox-}" "$G"; }
+  msg "watching $RREMOTE:$p every ${s}s (session ${name#ab-}); stop: ab session kill ${name#ab-}" "$G"; }
 rcwatchrun(){ local s="$1" p="$2"; AB_RC_YES=1   # internal: the loop run inside the session pane
   while :; do rcsync "$p" || msg "this round failed, retrying in ${s}s" "$Y"; sleep "$s"; done; }
 rcwatchrunall(){ local s="$1"; AB_RC_YES=1        # internal: the sync-all loop run inside the session pane
@@ -756,15 +756,15 @@ usage(){
     "${DM}usage: ab <command> [args]    ·    ab <name> [cmd]  runs a box${Z}"
   hd "▍Boxes"
   row "<name> [cmd]" ""   "run a box scoped to this folder — builds from its profile if missing, runs cmd (else its RUN)"
-  row "" ""               "  no cmd → per-folder tmux session (survives ssh-drop);  unknown name → a default claude box"
-  row "<name> -n" ""      "  -n / --new opens an extra session in the SAME folder (default re-attaches the existing one)"
+  row "" ""               "  no cmd → a fresh tmux session each launch (ab-<box>-<folder>-<rand>, survives ssh-drop)"
+  row "" ""               "  reattach an earlier session with 'ab session';  unknown name → a default claude box"
   row save    "<name>"    "golden snapshot of that box's rootfs"
   row restore "<name>"    "restore that box from its snapshot"
   row remove  "<name>"    "delete the box rootfs + snapshot (asks whether to delete the profile conf too)"
   row rebuild "<name>"    "force-rebuild the box from its profile (keeps the snapshot)"
   row "pkg <name>" "[add|rm|search]" "edit a simple-mode profile's PKGS, or search the box's apt catalog (rebuild to apply)"
-  hd "▍Sessions  ${DM}(interactive 'ab <name>' auto-opens one per folder; auto wakelock)${Z}"
-  row session "[name]"    "no arg = list + pick to reattach; name = open/reattach this folder's box <name> session"
+  hd "▍Sessions  ${DM}(interactive 'ab <name>' opens a fresh one each launch; auto wakelock)${Z}"
+  row session "[name]"    "no arg = list + pick to reattach; name = open a new <name> session here (like 'ab <name>')"
   row "session kill" "[name]" "kill a session (no name = pick; wakelock auto-released when all end)"
   hd "▍Sync  ${DM}(rclone bisync, manual trigger)${Z}"
   row sync    "[path]"    "sync cwd ⇄ ${RREMOTE}:<path> (no arg = status)"

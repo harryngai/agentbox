@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# agentbox installer — v3.4.1 (version stamp only: this always pulls the latest agentbox from main).
+# agentbox installer — v3.5.0 (version stamp only: this always pulls the latest agentbox from main).
 #   curl -fsSL https://raw.githubusercontent.com/harryngai/agentbox/main/install.sh | bash
 # Downloads the agentbox script, makes it executable, and links `agentbox` + `ab` onto your PATH.
 # Safe to re-run any time — it just pulls the latest version (so this doubles as an updater).
