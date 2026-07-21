@@ -1,6 +1,6 @@
 #!/data/data/com.termux/files/usr/bin/bash
 # Version — single source of truth; the installer greps ^VERSION= (keep the line bare, no trailing comment).
-VERSION=3.2.2
+VERSION=3.3.0
 # agentbox — throwaway, folder-scoped AI-agent boxes for a phone (Android Termux + proot-distro ONLY).
 #
 # THREAT MODEL: this protects YOUR FILES from *accidents* (an agent touching the wrong folder), not from a hostile
@@ -706,9 +706,22 @@ setup(){ local t="${AGENTBOX_TTY:-/dev/tty}" ans i=0 tot cmd title why rest s; l
   printf '\n' > "$t"; msg "setup complete — try: ab claude   (scopes claude to the current folder)" "$G"; }
 
 # ── Update (re-run the installer) ──────────────────────────────────
+# Resolve the tracked branch's HEAD commit via the GitHub API and install pinned to that SHA. raw.githubusercontent.com
+# caches the branch URL for up to 5 min (query strings and no-cache headers do NOT bust it — only a commit-pinned URL is
+# guaranteed fresh), so a plain `curl main/install.sh` right after a push can reinstall the OLD version. Falls back to the
+# branch URL for a non-GitHub base or if the API is unreachable.
 update(){ { has curl || has wget; } || { msg "need curl or wget to update" "$R"; return 1; }
-  msg "re-running the installer ($AGBASE/install.sh)…" "$G"
-  if has curl; then curl -fsSL "$AGBASE/install.sh" | bash; else wget -qO- "$AGBASE/install.sh" | bash; fi; }
+  local base="$AGBASE" slug branch sha j rest
+  case "$AGBASE" in https://raw.githubusercontent.com/*/*/*)
+    rest=${AGBASE#https://raw.githubusercontent.com/}; slug=${rest%/*}; branch=${rest##*/}
+    if has curl; then j=$(curl -fsSL --connect-timeout 5 --max-time 15 "https://api.github.com/repos/$slug/commits/$branch" 2>/dev/null)
+    else j=$(wget -qO- --timeout=15 "https://api.github.com/repos/$slug/commits/$branch" 2>/dev/null); fi
+    sha=$(printf '%s' "$j" | grep -oE '[0-9a-f]{40}' | head -1)
+    [ ${#sha} -eq 40 ] && base="https://raw.githubusercontent.com/$slug/$sha";; esac
+  if [ "$base" = "$AGBASE" ]; then msg "re-running the installer ($AGBASE/install.sh — may lag up to 5 min behind a fresh push)…" "$Y"
+  else msg "updating to $slug@${sha:0:7} (pinned — bypasses the CDN cache)…" "$G"; fi
+  if has curl; then curl -fsSL "$base/install.sh" | AGENTBOX_BASE="$base" bash
+  else wget -qO- "$base/install.sh" | AGENTBOX_BASE="$base" bash; fi; }
 
 # ── Help screen ────────────────────────────────────────────────────
 row(){ local n=$((30-$(dw "$1${2:+ $2}"))); ((n<1)) && n=1
@@ -735,7 +748,7 @@ usage(){
   row "sync remove" "[path]" "delete a pair's sync state"
   hd "▍Tool"
   row setup   ""          "guided bootstrap — links · font · keys · tmux · unkill · proot · tokens (re-runnable)"
-  row update  ""          "re-run the installer  (curl \$AGBASE/install.sh | bash)"
+  row update  ""          "reinstall the latest commit (SHA-pinned via GitHub API; skips the raw CDN cache)"
   row help    ""          "this screen          (ab version = version)"
   printf '\n%s\n' "${DM}profile $(short "$VC")/box-<name>.conf — simple: AGENT(claude|codex|copilot|none)·PKGS·TOKENS·RUN·MOUNT(cwd|none)·EPHEMERAL(0|1)·DESKTOP(xfce)·APP(code|browser)·MITM(0|1)·DIST(base distro);  docker: set INSTALL='…' for raw build steps${Z}"
   printf '%s\n' "${DM}tokens live in $(short "$ENVF") (0600; only a profile's TOKENS keys are injected; AGENTBOX_* excluded)${Z}"
