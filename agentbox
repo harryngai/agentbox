@@ -1,6 +1,6 @@
 #!/data/data/com.termux/files/usr/bin/bash
 # Version — single source of truth; the installer greps ^VERSION= (keep the line bare, no trailing comment).
-VERSION=3.10.0
+VERSION=3.11.0
 # agentbox — throwaway, folder-scoped AI-agent boxes for a phone (Android Termux + proot-distro ONLY).
 #
 # THREAT MODEL: this protects YOUR FILES from *accidents* (an agent touching the wrong folder), not from a hostile
@@ -133,6 +133,18 @@ EOF
 }
 # Read a profile/template's '# template-version:' stamp (empty if unstamped, e.g. a pre-3.8 copy).
 tplver(){ sed -n 's/^# *template-version:[[:space:]]*\([^[:space:]]*\).*/\1/p' "$1" 2>/dev/null | head -1; }
+# One-line summary of a template's key settings (what it runs · tokens it needs · notable flags) — used by the help screen.
+tpldesc(){ ( . "$1" 2>/dev/null; local d
+  if [ -n "$INSTALL" ]; then d="complex mode"; [ -n "$DESKTOP" ] && d="${DIST:-debian} $DESKTOP desktop, complex mode"
+  elif [ -n "$DESKTOP" ]; then d="$DESKTOP desktop ($APP)"
+  elif [ "${AGENT:-none}" = none ]; then d="plain shell"
+  elif [ -z "$RUN" ]; then d="$AGENT installed, opens a shell"
+  else d="runs $RUN"; fi
+  [ -n "$TOKENS" ] && d="$d · $(printf '%s' "$TOKENS" | tr ' ' ',')"
+  [ "${MITM:-0}" = 1 ] && d="$d · MITM"
+  [ "${EPHEMERAL:-0}" = 1 ] && d="$d · throwaway"
+  [ "${MOUNT:-cwd}" = none ] && d="$d · sealed"
+  printf '%s' "$d" ) }
 # Seed a profile file: a shipped template of that name if valid, else the built-in default (kept 0600).
 aboxdefault(){ local path="$1" name="$2" src="$TPL/$name.conf"
   if [ -f "$src" ] && [ -s "$src" ] && grep -q '^# agentbox box profile' "$src"; then ( umask 077; cp "$src" "$path" )
@@ -499,10 +511,12 @@ selfok(){ local e; e=$(bash -n "$SELF" 2>&1) && return 0
   printf '%s\n' "$e" | while IFS= read -r l; do msg "  $l" "$Y"; done; return 1; }
 # List/pick agentbox tmux sessions to reattach (mode=enter) or kill (mode=kill).
 sesspick(){ local mode="${1:-enter}" names=() n path i=1 c
+  # List EVERY tmux session (not just ab-*): agentbox's own — box · host-* · sync · boxgui, plus legacy ones that predate
+  # the ab- prefix (e.g. an old 'sync-all') and anything you started yourself. The picker reattaches/kills your choice.
   while IFS=$'\t' read -r n path; do [ -n "$n" ] || continue; names+=("$n")
       printf '  %s) %s%s\n' "$i" "${n#ab-}" "${path:+  $(short "$path")}"; i=$((i+1)); done \
-    < <(tmux ls -F "#S"$'\t'"#{pane_current_path}" 2>/dev/null | grep '^ab-')
-  [ ${#names[@]} -eq 0 ] && { msg "no agentbox sessions — open one: ab session <name>" "$Y"; return 0; }
+    < <(tmux ls -F "#S"$'\t'"#{pane_current_path}" 2>/dev/null)
+  [ ${#names[@]} -eq 0 ] && { msg "no tmux sessions — open one: ab session <name>" "$Y"; return 0; }
   printf '%s which? [1-%s, q=cancel] ' "$([ "$mode" = kill ] && echo kill || echo reattach)" "${#names[@]}"; read -r c
   case "$c" in ''|q|Q) return 0;; *[!0-9]*) msg "enter a number" "$R"; return 1;; esac
   { [ "$c" -ge 1 ] && [ "$c" -le ${#names[@]} ]; } || { msg "out of range" "$R"; return 1; }
@@ -532,7 +546,7 @@ session(){ local k n; case "${1:-}" in
     ""|ls|list) sesspick;;
     kill) shift
       if [ -n "${1:-}" ]; then n=0
-        for k in $(tmux ls -F '#S' 2>/dev/null | grep -E "^ab-$1(-|\$)"); do
+        for k in $(tmux ls -F '#S' 2>/dev/null | grep -E "^(ab-)?$1(-|\$)"); do   # match ab-<name> or a bare <name>
           tmux kill-session -t "=$k" 2>/dev/null && n=$((n+1)); done
         [ "$n" -gt 0 ] && msg "killed $n session(s) for '$1'" "$G" || msg "no session for '$1'" "$Y"
         anysession || { [ "$(wakestat)" = on ] && wakeoff; }
@@ -807,7 +821,7 @@ usage(){
   row rebuild "<name>"    "force-rebuild the box from its profile (keeps the snapshot)"
   row "pkg <name>" "[add|rm|search]" "edit a simple profile's PKGS or search its apt catalog (rebuild to apply)"
   hd "▍Sessions" "(interactive 'ab <name>' opens a fresh one each launch; auto wakelock)"
-  row session "[name]"    "no arg = list + pick to reattach; name = a new session (host-* → a host shell, not a box)"
+  row session "[name]"    "no arg = list EVERY tmux session (reattach/kill); name = a new session (host-* → a host shell)"
   row "session kill" "[name]" "kill a session (no name = pick; wakelock frees when all end)"
   hd "▍Sync" "(rclone bisync, manual trigger)"
   row sync    "[path]"    "sync cwd ⇄ ${RREMOTE}:<path> (no arg = status)"
@@ -819,6 +833,10 @@ usage(){
   row update  ""          "pull the latest version (code + templates only)"
   row help    ""          "show this help screen"
   row version ""          "print the agentbox version"
+  hd "▍Templates" "ab <name> creates a box from one; your edits then live in $(short "$VC")"
+  local tf; for tf in "$TPL"/*.conf; do [ -e "$tf" ] || { row "" "" "(none installed — run ab update)"; break; }
+    row "$(printf '%-7s' "$(basename "$tf" .conf)")" "v$(tplver "$tf")" "$(tpldesc "$tf")"
+  done
   hd "▍Notes"
   nt profile  "$(short "$VC")/box-<name>.conf — AGENT·PKGS·TOKENS·RUN·MOUNT·EPHEMERAL·DESKTOP·APP·MITM·DIST  (docker: set INSTALL='…')"
   nt tokens   "$(short "$ENVF")  (0600; only a profile's TOKENS keys are injected; AGENTBOX_* excluded)"
