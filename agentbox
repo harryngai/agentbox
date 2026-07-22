@@ -1,6 +1,6 @@
 #!/data/data/com.termux/files/usr/bin/bash
 # Version — single source of truth; the installer greps ^VERSION= (keep the line bare, no trailing comment).
-VERSION=3.11.3
+VERSION=3.12.0
 # agentbox — throwaway, folder-scoped AI-agent boxes for a phone (Android Termux + proot-distro ONLY).
 #
 # THREAT MODEL: this protects YOUR FILES from *accidents* (an agent touching the wrong folder), not from a hostile
@@ -118,7 +118,7 @@ wtarget(){ printf '/work-%s' "$(printf '%s' "${PWD#/}" | tr 'A-Z' 'a-z' | sed 's
 # Built-in fallback profile: baked in so the tool works with no templates dir at all (git + gh + node22 + claude-code).
 builtin_default_profile(){ cat <<'EOF'
 # agentbox box profile: claude — Claude Code, kept to just this one folder. YOUR copy, tweak it freely.
-# template-version: 3.8.0                    # bumps when this template gains new options — ab tells you if yours is behind
+# template-version: 3.12.0                   # bumps whenever this template changes — ab warns if your copy is behind
 # Baked-in fallback, identical to the claude template — used when no shipped templates are present.
 # Simple mode — just pick an AGENT and go. Want full control? Set INSTALL='…' and write the build steps yourself.
 AGENT=claude                        # who runs the box:  claude · codex · copilot · none
@@ -297,6 +297,22 @@ EOS
   [ "$mitm" = 1 ] && kv "  mitmweb UI" "http://localhost:8083 (open in the box browser)" "$Y"
   kv "  password (both)" "$pw" "$G"
   msg "  stop / drop the box: ab remove $prof" "$Y"; return 0; }
+# Every box gets a colourful interactive shell: colour ls/grep + a colour prompt, TERM defaulted to 256-colour. Written
+# host-side into the rootfs (idempotent) so it also fixes EXISTING boxes on the next launch — no rebuild needed.
+boxcolour(){ local r="$1"; [ -d "$r/etc" ] || return 0; mkdir -p "$r/etc/profile.d"
+  cat > "$r/etc/profile.d/agentbox-colour.sh" <<'ABC'
+export TERM="${TERM:-xterm-256color}"
+alias ls='ls --color=auto'
+alias ll='ls -alF --color=auto'
+alias la='ls -A --color=auto'
+alias grep='grep --color=auto'
+alias fgrep='fgrep --color=auto'
+alias egrep='egrep --color=auto'
+PS1='\[\e[1;32m\]\u@\h\[\e[0m\]:\[\e[1;34m\]\w\[\e[0m\]\$ '
+ABC
+  # /etc/bash.bashrc is sourced by interactive non-login shells (what a box's `exec bash` is); point it at the file above.
+  grep -q agentbox-colour "$r/etc/bash.bashrc" 2>/dev/null \
+    || printf '\n[ -f /etc/profile.d/agentbox-colour.sh ] && . /etc/profile.d/agentbox-colour.sh  # agentbox-colour\n' >> "$r/etc/bash.bashrc"; }
 # `ab <name> [cmd]` — build box <name> from its profile if missing, then run it scoped to the cwd.
 abox(){ local prof="$1"; shift; local cmd="$*" cf alias rootfs \
     INSTALL= TOKENS= RUN= MOUNT=cwd EPHEMERAL=0 DESKTOP= APP=code MITM=0 AGENT= PKGS= DIST= ef efn rc tgt run incmd mitmblock= ms=
@@ -309,7 +325,7 @@ abox(){ local prof="$1"; shift; local cmd="$*" cf alias rootfs \
   if [ -f "$cf" ]; then                                         # existing copy: warn if the pristine template moved past it
     local cv tv src="$TPL/$prof.conf"; cv=$(tplver "$cf"); tv=$(tplver "$src" 2>/dev/null)
     [ -n "$cv" ] && [ -n "$tv" ] && [ "$cv" != "$tv" ] \
-      && msg "note: $(short "$cf") is from the $prof template v$cv; the current template is v$tv — re-check it for new options" "$Y"
+      && msg "note: $(short "$cf") is from the $prof template v$cv; the current template is v$tv — it changed since, worth a look" "$Y"
   else mkdir -p "$VC"; aboxdefault "$cf" "$prof" || return 1
     msg "new profile $(short "$cf") — binds only the launch folder, injects only its tokens (edit it directly)" "$Y"; fi
   . "$cf"; mkenv
@@ -324,6 +340,7 @@ abox(){ local prof="$1"; shift; local cmd="$*" cf alias rootfs \
     aboxbuild "$prof" || return 1
   fi
   rootfs=$(pdroot "$alias"); [ -n "$rootfs" ] || { msg "box '$prof' not built" "$R"; return 1; }
+  boxcolour "$rootfs"                                            # colour the box's shell (ls/grep/prompt + 256-colour TERM)
   # DESKTOP set → run a scoped desktop (background); nothing after this runs for a GUI box.
   [ -n "$DESKTOP" ] && { aboxgui "$prof" "$alias" "$rootfs" "$APP" "$MOUNT" "$MITM"; return $?; }
   run="${cmd:-$RUN}"; [ "$MITM" = 1 ] && ms='; mitm on'
@@ -335,7 +352,7 @@ for i in $(seq 1 15); do [ -f "$HOME/.mitmproxy/mitmproxy-ca-cert.pem" ] && brea
 export NODE_EXTRA_CA_CERTS=$HOME/.mitmproxy/mitmproxy-ca-cert.pem HTTP_PROXY=http://127.0.0.1:8082 HTTPS_PROXY=http://127.0.0.1:8082
 '; fi
   # source+delete the token file, run the (optional) mitm setup, then exec RUN in the working dir; $1 = in-box start dir.
-  incmd='set -a; . /root/'"$efn"' 2>/dev/null; rm -f /root/'"$efn"'; set +a; export HOME=/root; cd "$1"; '"$mitmblock"'exec '"${run:-bash}"
+  incmd='set -a; . /root/'"$efn"' 2>/dev/null; rm -f /root/'"$efn"'; set +a; export HOME=/root TERM="${TERM:-xterm-256color}"; cd "$1"; '"$mitmblock"'exec '"${run:-bash}"
   if [ "${MOUNT:-cwd}" = none ]; then
     msg "box '$prof' — SEALED (no folder bound); tokens: ${TOKENS:-none}; running: ${run:-bash}$ms" "$G"
     proot-distro login "$alias" --isolated -- bash -c "$incmd" _ /root
