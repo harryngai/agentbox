@@ -1,6 +1,6 @@
 #!/data/data/com.termux/files/usr/bin/bash
 # Version — single source of truth; the installer greps ^VERSION= (keep the line bare, no trailing comment).
-VERSION=3.11.2
+VERSION=3.11.3
 # agentbox — throwaway, folder-scoped AI-agent boxes for a phone (Android Termux + proot-distro ONLY).
 #
 # THREAT MODEL: this protects YOUR FILES from *accidents* (an agent touching the wrong folder), not from a hostile
@@ -140,7 +140,6 @@ tpldesc(){ ( . "$1" 2>/dev/null; local d
   elif [ "${AGENT:-none}" = none ]; then d="plain shell"
   elif [ -z "$RUN" ]; then d="$AGENT installed, opens a shell"
   else d="runs $RUN"; fi
-  [ -n "$TOKENS" ] && d="$d · $(printf '%s' "$TOKENS" | tr ' ' ',')"
   [ "${MITM:-0}" = 1 ] && d="$d · MITM"
   [ "${EPHEMERAL:-0}" = 1 ] && d="$d · throwaway"
   [ "${MOUNT:-cwd}" = none ] && d="$d · sealed"
