@@ -9,6 +9,9 @@ Versioning is `major.normal.minor`:
 
 `ab update` always pulls the latest from `main`, so `ab version` is the source of truth for what's deployed. Each box template also carries its own `# template-version:` stamp, bumped whenever that template's file changes; `ab` warns when your `~/.config/agentbox/box-<name>.conf` copy is behind the shipped template.
 
+## 3.13.0
+- Profiles now live at `~/.config/agentbox/profile/<name>.conf` — no `box-` prefix, same filename as the template. Existing `box-<name>.conf` files are migrated automatically on the next `ab` run. (Snapshots stay `box-snapshot-<name>.tar.gz`.)
+
 ## 3.12.1
 - **Critical fix:** `ab <name>` seeded *every* first-time non-claude box from the built-in claude default instead of the real template — so `ab web`, `ab run`, `ab codex`, etc. all opened a claude box. Cause: a bash pitfall in `aboxdefault` where a single `local path=… name=… src="$TPL/$name.conf"` expanded `$name` before it was assigned, making `src` always `$TPL/.conf` (missing). The v3.10.0 fallback warning is what finally surfaced it.
 

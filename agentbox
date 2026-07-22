@@ -1,6 +1,6 @@
 #!/data/data/com.termux/files/usr/bin/bash
 # Version — single source of truth; the installer greps ^VERSION= (keep the line bare, no trailing comment).
-VERSION=3.12.1
+VERSION=3.13.0
 # agentbox — throwaway, folder-scoped AI-agent boxes for a phone (Android Termux + proot-distro ONLY).
 #
 # THREAT MODEL: this protects YOUR FILES from *accidents* (an agent touching the wrong folder), not from a hostile
@@ -105,11 +105,16 @@ envedit(){ mkenv
   msg "updated $ENVF" "$G"; }
 
 # ── Boxes / profiles ───────────────────────────────────────────────
-# A box is a proot-distro container built from a profile (box-<name>.conf): it installs only what INSTALL lists, binds
+# A box is a proot-distro container built from a profile (<name>.conf): it installs only what INSTALL lists, binds
 # ONLY the launch folder (as /work-<kebab(cwd)>, unique per host folder so concurrent agents don't collide), and injects
 # ONLY the tokens TOKENS lists. `ab <name>` from a folder builds the box if missing and runs it there. Profiles are just
-# files: your editable copy at $VC/box-<name>.conf, seeded from $TPL/<name>.conf (or a built-in claude profile if none).
-aboxconf(){ echo "$VC/box-$1.conf"; }
+# files: your editable copy at $VC/profile/<name>.conf, seeded from $TPL/<name>.conf (same filename, no box- prefix).
+aboxconf(){ echo "$VC/profile/$1.conf"; }
+# One-time migration: profiles used to live at $VC/box-<name>.conf; move any into $VC/profile/<name>.conf. Cheap no-op
+# once done (the glob matches nothing). Snapshots stay as $STATE/box-snapshot-<name>.tar.gz — only the conf moved.
+migrateconf(){ local f b; for f in "$VC"/box-*.conf; do [ -e "$f" ] || return 0
+    mkdir -p "$VC/profile"; b=$(basename "$f" .conf); b=${b#box-}
+    [ -e "$VC/profile/$b.conf" ] || mv "$f" "$VC/profile/$b.conf"; done; }
 aboxalias(){ echo "agentbox-$1"; }   # proot container prefix (agentbox-<name>); tmux sessions use the shorter ab- prefix
 aboxtemplates(){ local f b out=; for f in "$TPL"/*.conf; do [ -e "$f" ] || break
     b=$(basename "$f" .conf); out="$out · $b"; done; echo "${out# · }"; }
@@ -326,7 +331,7 @@ abox(){ local prof="$1"; shift; local cmd="$*" cf alias rootfs \
     local cv tv src="$TPL/$prof.conf"; cv=$(tplver "$cf"); tv=$(tplver "$src" 2>/dev/null)
     [ -n "$cv" ] && [ -n "$tv" ] && [ "$cv" != "$tv" ] \
       && msg "note: $(short "$cf") is from the $prof template v$cv; the current template is v$tv — it changed since, worth a look" "$Y"
-  else mkdir -p "$VC"; aboxdefault "$cf" "$prof" || return 1
+  else mkdir -p "$(dirname "$cf")"; aboxdefault "$cf" "$prof" || return 1
     msg "new profile $(short "$cf") — binds only the launch folder, injects only its tokens (edit it directly)" "$Y"; fi
   . "$cf"; mkenv
   # Auto-session: an interactive, command-less CLI box opens a fresh tmux session each launch (survives ssh-drop;
@@ -367,8 +372,8 @@ export NODE_EXTRA_CA_CERTS=$HOME/.mitmproxy/mitmproxy-ca-cert.pem HTTP_PROXY=htt
   return $rc; }
 # `ab` / `ab ls` — every box (built or profile-only) + templates + snapshots, one picture.
 boxls(){ local f prof n=0 sn=0 tpl
-  for f in "$VC"/box-*.conf; do [ -e "$f" ] || break
-    prof=$(basename "$f" .conf); prof=${prof#box-}; n=$((n+1))
+  for f in "$VC"/profile/*.conf; do [ -e "$f" ] || break
+    prof=$(basename "$f" .conf); n=$((n+1))
     [ -n "$(pdroot "$(aboxalias "$prof")")" ] && st "$prof" "built · ab $prof" "$G" \
       || st "$prof" "profile · ab $prof builds it" "$Y"
   done
@@ -862,7 +867,7 @@ usage(){
     row "$(printf '%-7s' "$(basename "$tf" .conf)")" "v$(tplver "$tf")" "$(tpldesc "$tf")"
   done
   hd "▍Notes"
-  nt profile  "$(short "$VC")/box-<name>.conf — AGENT·PKGS·TOKENS·RUN·MOUNT·EPHEMERAL·DESKTOP·APP·MITM·DIST  (docker: set INSTALL='…')"
+  nt profile  "$(short "$VC")/profile/<name>.conf — AGENT·PKGS·TOKENS·RUN·MOUNT·EPHEMERAL·DESKTOP·APP·MITM·DIST  (docker: set INSTALL='…')"
   nt tokens   "$(short "$ENVF")  (0600; only a profile's TOKENS keys are injected; AGENTBOX_* excluded)"
   nt reserved "save restore remove rebuild pkg setup update sync session help version ls list"
   nt network  "shares the phone network — for a different exit IP use a whole-device Android VPN app"
@@ -870,6 +875,7 @@ usage(){
 }
 
 # ── Command dispatch ───────────────────────────────────────────────
+migrateconf   # move any pre-3.13 $VC/box-<name>.conf profiles into $VC/profile/ (no-op once done)
 case "${1:-}" in
   "") usage full;;                                # bare ab → banner + current boxes + help
   ls|list) boxls;;
