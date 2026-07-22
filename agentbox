@@ -1,6 +1,6 @@
 #!/data/data/com.termux/files/usr/bin/bash
 # Version — single source of truth; the installer greps ^VERSION= (keep the line bare, no trailing comment).
-VERSION=3.12.0
+VERSION=3.12.1
 # agentbox — throwaway, folder-scoped AI-agent boxes for a phone (Android Termux + proot-distro ONLY).
 #
 # THREAT MODEL: this protects YOUR FILES from *accidents* (an agent touching the wrong folder), not from a hostile
@@ -145,7 +145,7 @@ tpldesc(){ ( . "$1" 2>/dev/null; local d
   [ "${MOUNT:-cwd}" = none ] && d="$d · sealed"
   printf '%s' "$d" ) }
 # Seed a profile file: a shipped template of that name if valid, else the built-in default (kept 0600).
-aboxdefault(){ local path="$1" name="$2" src="$TPL/$name.conf"
+aboxdefault(){ local path="$1" name="$2" src="$TPL/$2.conf"   # NB: $2, not $name — a var can't reference a sibling set in the SAME 'local' (it expands before the assignment), which silently made src=$TPL/.conf and every non-claude box fall back to claude
   if [ -f "$src" ] && [ -s "$src" ] && grep -q '^# agentbox box profile' "$src"; then ( umask 077; cp "$src" "$path" )
   else ( umask 077; builtin_default_profile > "$path" )   # no valid template → the built-in default (a CLAUDE box)
     msg "no '$name' template found — seeded $(short "$path") from the built-in default, which is a CLAUDE box. If you expected a shipped template ('$name'), run 'ab update' to (re)fetch it, then: ab remove $name && ab $name" "$Y"

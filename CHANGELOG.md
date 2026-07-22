@@ -9,6 +9,9 @@ Versioning is `major.normal.minor`:
 
 `ab update` always pulls the latest from `main`, so `ab version` is the source of truth for what's deployed. Each box template also carries its own `# template-version:` stamp, bumped whenever that template's file changes; `ab` warns when your `~/.config/agentbox/box-<name>.conf` copy is behind the shipped template.
 
+## 3.12.1
+- **Critical fix:** `ab <name>` seeded *every* first-time non-claude box from the built-in claude default instead of the real template — so `ab web`, `ab run`, `ab codex`, etc. all opened a claude box. Cause: a bash pitfall in `aboxdefault` where a single `local path=… name=… src="$TPL/$name.conf"` expanded `$name` before it was assigned, making `src` always `$TPL/.conf` (missing). The v3.10.0 fallback warning is what finally surfaced it.
+
 ## 3.12.0
 - **Colour in every box** — boxes now get a colourful interactive shell: `ls`/`grep`/`ll` coloured, a colour prompt, and `TERM` defaulted to `xterm-256color`. Written into the rootfs host-side at launch (idempotent), so existing boxes get colour on their next launch — no rebuild needed. `TERM` is also exported into the box so the agent/`RUN` process renders colour too.
 - **Template versions reconciled** — all shipped templates are stamped `3.12.0`; a template's stamp now bumps whenever its file changes (not only on new options). The "your copy is behind" note is worded neutrally ("it changed since, worth a look").
