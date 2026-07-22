@@ -1,6 +1,6 @@
 #!/data/data/com.termux/files/usr/bin/bash
 # Version — single source of truth; the installer greps ^VERSION= (keep the line bare, no trailing comment).
-VERSION=3.14.2
+VERSION=3.15.0
 # agentbox — throwaway, folder-scoped AI-agent boxes for a phone (Android Termux + proot-distro ONLY).
 #
 # THREAT MODEL: this protects YOUR FILES from *accidents* (an agent touching the wrong folder), not from a hostile
@@ -238,6 +238,15 @@ aboxguistop(){ local prof rootfs; prof=$(cat "$STATE/boxgui.prof" 2>/dev/null)
 # which aboxguistop then deletes. To force a fresh rebuild instead, use `ab remove <name>`.
 boxstop(){ tmux has-session -t "=ab-boxgui" 2>/dev/null || { msg "no box desktop is running" "$Y"; return 0; }
   aboxguistop; msg "box desktop stopped" "$G"; }
+# `ab pw <name> [password]` — set (or show) a desktop box's login password. Stored 0600 at $VC/gui-<name>.pw; aboxgui uses
+# it instead of a fresh random one. Applies on the next launch (ab stop; ab <name>). No password arg → show the current.
+abpw(){ local prof="${1:-}" pw="${2:-}" f
+  [ -n "$prof" ] || { msg "usage: ab pw <name> [password]   (no password = show the current one)" "$Y"; return 1; }
+  f="$VC/gui-$prof.pw"
+  if [ -n "$pw" ]; then mkdir -p "$VC"; ( umask 077; printf '%s' "$pw" > "$f" )
+    msg "password for '$prof' set (0600) — applies on the next launch: ab stop; ab $prof" "$G"
+  elif [ -f "$f" ]; then msg "'$prof' desktop password: $(cat "$f")   (change: ab pw $prof <new>)" "$G"
+  else msg "'$prof' uses a fresh random password each launch. Set a fixed one: ab pw $prof <password>" "$Y"; fi; }
 # If <prof>'s desktop is the one currently running, stop it before we delete/rebuild its rootfs (proot is userspace —
 # rm -rf under a live session would corrupt it and orphan the session + wakelock).
 aboxguard(){ [ -f "$STATE/boxgui.prof" ] && [ "$(cat "$STATE/boxgui.prof" 2>/dev/null)" = "$1" ] \
@@ -247,22 +256,23 @@ aboxguard(){ [ -f "$STATE/boxgui.prof" ] && [ "$(cat "$STATE/boxgui.prof" 2>/dev
 # box. Own ports (6902/8081, localhost); one box desktop at a time (session ab-boxgui). Fresh random password each
 # start, printed. MOUNT=none binds nothing (SEALED); otherwise the cwd opens as /work-<cwd>. MITM=1 routes chromium
 # through mitmweb (CA trusted into the box's nssdb, proxy flag added).
-aboxgui(){ local prof="$1" alias="$2" rootfs="$3" app="${4:-code}" mnt="${5:-cwd}" mitm="${6:-0}" pw tgt geo
+aboxgui(){ local prof="$1" alias="$2" rootfs="$3" app="${4:-code}" mnt="${5:-cwd}" mitm="${6:-0}" lan="${7:-0}" pw tgt geo iface=127.0.0.1 lip=
+  [ "$lan" = 1 ] && iface=0.0.0.0                              # LAN=1 → bind KasmVNC/code-server to all interfaces (mitmweb stays local)
   needtmux || return 1
   { [ -x "$rootfs/usr/bin/startxfce4" ] && [ -d "$rootfs/usr/share/kasmvnc" ]; } \
     || { msg "the desktop stack isn't in box '$prof' yet — rebuild it: ab remove $prof && ab $prof" "$Y"; return 1; }
   tmux has-session -t "=ab-boxgui" 2>/dev/null \
     && { msg "a box desktop is already running (one at a time) — close it first: ab stop" "$Y"; return 1; }
-  pw=$(gui_randpw)
+  pw=$(cat "$VC/gui-$prof.pw" 2>/dev/null); [ -n "$pw" ] || pw=$(gui_randpw)   # a fixed password (ab pw <name>) wins, else random
   mkdir -p "$rootfs/root/.vnc" "$rootfs/root/.config/code-server"
   # blacklist_threshold=100: every client arrives as 127.0.0.1 and each page-load counts as a failed attempt — the
   # default threshold of 5 would blacklist the owner within a few loads.
-  printf 'network:\n  interface: 127.0.0.1\n  websocket_port: %s\n  ssl:\n    require_ssl: false\nsecurity:\n  brute_force_protection:\n    blacklist_threshold: 100\n    blacklist_timeout: 10\n' "$GUI_BOXWEB" > "$rootfs/root/.vnc/kasmvnc.yaml"
+  printf 'network:\n  interface: %s\n  websocket_port: %s\n  ssl:\n    require_ssl: false\nsecurity:\n  brute_force_protection:\n    blacklist_threshold: 100\n    blacklist_timeout: 10\n' "$iface" "$GUI_BOXWEB" > "$rootfs/root/.vnc/kasmvnc.yaml"
   printf '#!/bin/sh\nxset s off -dpms s noblank 2>/dev/null\nxsetroot -solid "#000000" 2>/dev/null\nexec xfce4-session\n' > "$rootfs/root/.vnc/xstartup"
   chmod +x "$rootfs/root/.vnc/xstartup"; : > "$rootfs/root/.vnc/.de-was-selected"
   # config.yaml (0600) is the ONLY secret file: it holds the shared password. The run script reads it from there so no
   # secret rides on argv. Geometry is expanded HOST-side (AGENTBOX_* is stripped from the box env).
-  ( umask 077; { echo "bind-addr: 127.0.0.1:$GUI_BOXCODE"; echo "auth: password"; echo "password: $pw"; echo "cert: false"; } > "$rootfs/root/.config/code-server/config.yaml" )
+  ( umask 077; { echo "bind-addr: $iface:$GUI_BOXCODE"; echo "auth: password"; echo "password: $pw"; echo "cert: false"; } > "$rootfs/root/.config/code-server/config.yaml" )
   geo="${AGENTBOX_GUI_GEOMETRY:-1440x900}"; tgt=$(wtarget); [ "$mnt" = none ] && tgt=/root
   { cat <<EOS
 #!/bin/bash
@@ -292,7 +302,7 @@ CH=$(command -v chromium chromium-browser 2>/dev/null | head -1)
 [ -n "$CH" ] && "$CH" --start-maximized about:blank >/dev/null 2>&1 &
 exec sleep infinity
 EOS
-    else printf 'exec code-server --bind-addr 127.0.0.1:%s %s\n' "$GUI_BOXCODE" "$tgt"; fi
+    else printf 'exec code-server --bind-addr %s:%s %s\n' "$iface" "$GUI_BOXCODE" "$tgt"; fi
   } > "$rootfs/root/.boxgui-run.sh"
   chmod +x "$rootfs/root/.boxgui-run.sh"
   [ "$(wakestat)" = on ] || wakeon || true
@@ -310,11 +320,13 @@ EOS
   [ "$mnt" = none ] && msg "box desktop '$prof' started — SEALED (no folder bound):" "$G" \
     || msg "box desktop '$prof' started — scoped to $(short "$PWD") (opens as $tgt):" "$G"
   kv "  desktop (KasmVNC)" "http://localhost:$GUI_BOXWEB  (login user: agent)" "$G"
+  [ "$lan" = 1 ] && { lip=$(lanips | awk '{print $1}'); [ -n "$lip" ] && kv "  on your LAN" "http://$lip:$GUI_BOXWEB  (anyone on this Wi-Fi, same password)" "$Y"; }
   [ "$app" = browser ] && kv "  browser" "chromium (opens in the desktop; reopen from the menu if closed)" "$G" \
     || kv "  VS Code" "http://localhost:$GUI_BOXCODE" "$G"
   [ "$mitm" = 1 ] && kv "  mitmweb UI" "http://localhost:8083 (open in the box browser)" "$Y"
   kv "  password (both)" "$pw" "$G"
-  msg "  close it: ab stop   ·   delete + rebuild fresh: ab remove $prof" "$Y"; return 0; }
+  kv "  close it" "ab stop  (keeps the box; reopen with ab $prof)" "$Y"
+  kv "  rebuild fresh" "ab remove $prof  (delete, then ab $prof)" "$Y"; return 0; }
 # Every box gets a colourful interactive shell: colour ls/grep + a colour prompt, TERM defaulted to 256-colour. Written
 # host-side into the rootfs (idempotent) so it also fixes EXISTING boxes on the next launch — no rebuild needed.
 boxcolour(){ local r="$1"; [ -d "$r/etc" ] || return 0; mkdir -p "$r/etc/profile.d"
@@ -333,7 +345,7 @@ ABC
     || printf '\n[ -f /etc/profile.d/agentbox-colour.sh ] && . /etc/profile.d/agentbox-colour.sh  # agentbox-colour\n' >> "$r/etc/bash.bashrc"; }
 # `ab <name> [cmd]` — build box <name> from its profile if missing, then run it scoped to the cwd.
 abox(){ local prof="$1"; shift; local cmd="$*" cf alias rootfs \
-    INSTALL= TOKENS= RUN= MOUNT=cwd EPHEMERAL=0 DESKTOP= APP=code MITM=0 AGENT= PKGS= DIST= ef efn rc tgt run incmd mitmblock= ms=
+    INSTALL= TOKENS= RUN= MOUNT=cwd EPHEMERAL=0 DESKTOP= APP=code MITM=0 LAN=0 AGENT= PKGS= DIST= ef efn rc tgt run incmd mitmblock= ms=
   case "$prof" in host-*)                                        # host-* is a host tmux session, never a box (no profile, no proot)
     if [ -z "$cmd" ] && [ -t 1 ] && [ -z "${TMUX:-}" ] && [ "${AB_NO_SESSION:-}" != 1 ]; then sessrun "$prof"; return $?; fi
     if [ -n "$cmd" ]; then exec "${SHELL:-bash}" -lc "$cmd"; else exec "${SHELL:-bash}" -l; fi;;
@@ -360,7 +372,7 @@ abox(){ local prof="$1"; shift; local cmd="$*" cf alias rootfs \
   rootfs=$(pdroot "$alias"); [ -n "$rootfs" ] || { msg "box '$prof' not built" "$R"; return 1; }
   boxcolour "$rootfs"                                            # colour the box's shell (ls/grep/prompt + 256-colour TERM)
   # DESKTOP set → run a scoped desktop (background); nothing after this runs for a GUI box.
-  [ -n "$DESKTOP" ] && { aboxgui "$prof" "$alias" "$rootfs" "$APP" "$MOUNT" "$MITM"; return $?; }
+  [ -n "$DESKTOP" ] && { aboxgui "$prof" "$alias" "$rootfs" "$APP" "$MOUNT" "$MITM" "$LAN"; return $?; }
   run="${cmd:-$RUN}"; [ "$MITM" = 1 ] && ms='; mitm on'
   ef="$rootfs/root/.abenv.$$"; efn=".abenv.$$"     # token file lives inside the isolated rootfs; nothing else is bound
   ( umask 077; aboxenv "$TOKENS" > "$ef" )
@@ -861,6 +873,7 @@ usage(){
   row remove  "<name>"    "delete the box rootfs + snapshot (also asks about the profile conf)"
   row rebuild "<name>"    "force-rebuild the box from its profile (keeps the snapshot)"
   row stop    ""          "close the running box desktop — keeps the box (ab remove = delete + rebuild)"
+  row "pw <name>" "[password]" "set/show a desktop box's login password (else it's random each launch)"
   row "pkg <name>" "[add|rm|search]" "edit a simple profile's PKGS or search its apt catalog (rebuild to apply)"
   hd "▍Sessions" "(interactive 'ab <name>' opens a fresh one each launch; auto wakelock)"
   row session "[name]"    "no arg = list EVERY tmux session to reattach/kill"
@@ -881,9 +894,9 @@ usage(){
     row "$(printf '%-7s' "$(basename "$tf" .conf)")" "v$(tplver "$tf")" "$(tpldesc "$tf")"
   done
   hd "▍Notes"
-  nt profile  "$(short "$VC")/profile/<name>.conf — AGENT·PKGS·TOKENS·RUN·MOUNT·EPHEMERAL·DESKTOP·APP·MITM·DIST  (docker: set INSTALL='…')"
+  nt profile  "$(short "$VC")/profile/<name>.conf — AGENT·PKGS·TOKENS·RUN·MOUNT·EPHEMERAL·DESKTOP·APP·MITM·LAN·DIST  (docker: set INSTALL='…')"
   nt tokens   "$(short "$ENVF")  (0600; only a profile's TOKENS keys are injected; AGENTBOX_* excluded)"
-  nt reserved "save restore remove rebuild stop pkg setup update sync session help version ls list"
+  nt reserved "save restore remove rebuild stop pw pkg setup update sync session help version ls list"
   nt network  "shares the phone network — for a different exit IP use a whole-device Android VPN app"
   return 0
 }
@@ -898,6 +911,7 @@ case "${1:-}" in
   remove)  shift; boxremove "$@";;
   rebuild) shift; if [ -n "${1:-}" ]; then aboxbuild "$1" force; else msg "which box? ab rebuild <name>" "$Y"; fi;;
   stop)    boxstop;;                              # close the running box desktop (keeps the box; ab remove = delete + rebuild)
+  pw)      shift; abpw "$@";;                      # set/show a desktop box's login password
   pkg)     shift; abpkg "$@";;
   setup)   setup;;
   update)  update;;

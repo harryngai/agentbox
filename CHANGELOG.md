@@ -9,6 +9,11 @@ Versioning is `major.normal.minor`:
 
 `ab update` always pulls the latest from `main`, so `ab version` is the source of truth for what's deployed. Each box template also carries its own `# template-version:` stamp, bumped whenever that template's file changes; `ab` warns when your `~/.config/agentbox/box-<name>.conf` copy is behind the shipped template.
 
+## 3.15.0
+- **`ab pw <name> [password]`** — set (or show) a desktop box's login password instead of the random one generated each launch. Stored 0600 at `~/.config/agentbox/gui-<name>.pw`; applies on the next launch.
+- **`LAN=1`** profile option (desktop boxes) — also serve the KasmVNC desktop on your Wi-Fi (`http://<phone-ip>:6902`), not just localhost. Default `0` (localhost only). mitmweb stays local. The desktop is password-protected; set a strong one with `ab pw` before exposing it.
+- The desktop's on-screen hints now split "close" and "rebuild" onto two lines.
+
 ## 3.14.2
 - **Fix a regression from 3.14.0:** the `--kill-on-exit` flag added to the desktop `proot-distro login` isn't accepted by proot-distro's `login`, so the desktop exited immediately ("box desktop exited immediately"). Reverted it. The original goal — killing the daemonised `Xvnc`/`chromium`/`mitmweb` that outlive the tmux session — is now done directly via `boxkillprocs`: it kills any process whose executable resolves inside the box rootfs (`/proc/<pid>/exe`), used by both `ab stop` and box deletion. Version-independent, no reliance on a proot-distro flag.
 
