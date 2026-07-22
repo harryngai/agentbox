@@ -1,6 +1,6 @@
 #!/data/data/com.termux/files/usr/bin/bash
 # Version — single source of truth; the installer greps ^VERSION= (keep the line bare, no trailing comment).
-VERSION=3.11.0
+VERSION=3.11.1
 # agentbox — throwaway, folder-scoped AI-agent boxes for a phone (Android Termux + proot-distro ONLY).
 #
 # THREAT MODEL: this protects YOUR FILES from *accidents* (an agent touching the wrong folder), not from a hostile
@@ -510,13 +510,20 @@ selfok(){ local e; e=$(bash -n "$SELF" 2>&1) && return 0
   msg "agentbox won't parse — not opening a session (fix the syntax error, or reinstall):" "$R"
   printf '%s\n' "$e" | while IFS= read -r l; do msg "  $l" "$Y"; done; return 1; }
 # List/pick agentbox tmux sessions to reattach (mode=enter) or kill (mode=kill).
-sesspick(){ local mode="${1:-enter}" names=() n path i=1 c
+sesspick(){ local mode="${1:-enter}" names=() dates=() paths=() n cr path i c maxw=0 disp d
   # List EVERY tmux session (not just ab-*): agentbox's own — box · host-* · sync · boxgui, plus legacy ones that predate
   # the ab- prefix (e.g. an old 'sync-all') and anything you started yourself. The picker reattaches/kills your choice.
-  while IFS=$'\t' read -r n path; do [ -n "$n" ] || continue; names+=("$n")
-      printf '  %s) %s%s\n' "$i" "${n#ab-}" "${path:+  $(short "$path")}"; i=$((i+1)); done \
-    < <(tmux ls -F "#S"$'\t'"#{pane_current_path}" 2>/dev/null)
+  # Two passes: gather rows + widest name, then print an aligned, coloured table (num · name · created · folder).
+  while IFS=$'\t' read -r n cr path; do [ -n "$n" ] || continue
+      names+=("$n"); paths+=("$path")
+      d=$(date -d "@$cr" '+%Y-%m-%d %H:%M' 2>/dev/null); dates+=("${d:-—}")
+      disp="${n#ab-}"; [ "${#disp}" -gt "$maxw" ] && maxw=${#disp}
+    done < <(tmux ls -F "#S"$'\t'"#{session_created}"$'\t'"#{pane_current_path}" 2>/dev/null)
   [ ${#names[@]} -eq 0 ] && { msg "no tmux sessions — open one: ab session <name>" "$Y"; return 0; }
+  for i in "${!names[@]}"; do disp="${names[i]#ab-}"
+    printf '  %s%2d)%s %s%-*s%s  %s%s%s  %s\n' \
+      "$CY" "$((i+1))" "$Z" "$BD" "$maxw" "$disp" "$Z" "$DM" "${dates[i]}" "$Z" "$(short "${paths[i]}")"
+  done
   printf '%s which? [1-%s, q=cancel] ' "$([ "$mode" = kill ] && echo kill || echo reattach)" "${#names[@]}"; read -r c
   case "$c" in ''|q|Q) return 0;; *[!0-9]*) msg "enter a number" "$R"; return 1;; esac
   { [ "$c" -ge 1 ] && [ "$c" -le ${#names[@]} ]; } || { msg "out of range" "$R"; return 1; }
@@ -812,7 +819,7 @@ usage(){
   fi
   [ "$withstatus" = full ] && { printf '\n'; boxls; }            # bare `ab` shows current boxes/templates/snapshots here
   hd "▍Boxes"
-  row "<name> [cmd]" ""   "run a box scoped to this folder — builds if missing, runs cmd (else RUN)"
+  row "<name>" "[cmd]"    "run a box scoped to this folder — builds if missing, runs cmd (else RUN)"
   row "" ""               "  no cmd → a fresh tmux session each launch (survives ssh-drop)"
   row "" ""               "  reattach an earlier one with 'ab session'; unknown name → a default claude box"
   row save    "<name>"    "golden snapshot of that box's rootfs"
@@ -821,7 +828,8 @@ usage(){
   row rebuild "<name>"    "force-rebuild the box from its profile (keeps the snapshot)"
   row "pkg <name>" "[add|rm|search]" "edit a simple profile's PKGS or search its apt catalog (rebuild to apply)"
   hd "▍Sessions" "(interactive 'ab <name>' opens a fresh one each launch; auto wakelock)"
-  row session "[name]"    "no arg = list EVERY tmux session (reattach/kill); name = a new session (host-* → a host shell)"
+  row session "[name]"    "no arg = list EVERY tmux session to reattach/kill"
+  row "" ""               "  name = open a new session here (host-* → a host shell, not a box)"
   row "session kill" "[name]" "kill a session (no name = pick; wakelock frees when all end)"
   hd "▍Sync" "(rclone bisync, manual trigger)"
   row sync    "[path]"    "sync cwd ⇄ ${RREMOTE}:<path> (no arg = status)"
