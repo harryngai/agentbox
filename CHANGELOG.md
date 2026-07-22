@@ -9,6 +9,9 @@ Versioning is `major.normal.minor`:
 
 `ab update` always pulls the latest from `main`, so `ab version` is the source of truth for what's deployed. Each box template also carries its own `# template-version:` stamp, bumped whenever that template's file changes; `ab` warns when your `~/.config/agentbox/box-<name>.conf` copy is behind the shipped template.
 
+## 3.14.1
+- Desktop stop hints now point at `ab stop` (close, keep the box) instead of `ab remove` — the old "already running, stop it: ab remove <name>" even named the wrong box (the one you were launching, not the one running). Desktops stay one-at-a-time by design; switch with `ab stop` then `ab <other>`.
+
 ## 3.14.0
 - **Desktop boxes no longer leak / lock up.** The desktop `proot-distro login` now runs with `--kill-on-exit`, so stopping it cleanly kills `Xvnc`/`chromium`/`mitmweb` instead of leaving orphans that hold the container "busy" (which had made `agentbox-web` un-removable and un-rebuildable). `aboxdrop` also force-kills any leftover procs before removing.
 - **`web` is no longer throwaway** (`EPHEMERAL=0`) — it builds once and reuses the box, so `ab web` doesn't re-download the desktop every launch. Rebuild fresh with `ab remove web`.

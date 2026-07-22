@@ -1,6 +1,6 @@
 #!/data/data/com.termux/files/usr/bin/bash
 # Version — single source of truth; the installer greps ^VERSION= (keep the line bare, no trailing comment).
-VERSION=3.14.0
+VERSION=3.14.1
 # agentbox — throwaway, folder-scoped AI-agent boxes for a phone (Android Termux + proot-distro ONLY).
 #
 # THREAT MODEL: this protects YOUR FILES from *accidents* (an agent touching the wrong folder), not from a hostile
@@ -244,7 +244,7 @@ aboxgui(){ local prof="$1" alias="$2" rootfs="$3" app="${4:-code}" mnt="${5:-cwd
   { [ -x "$rootfs/usr/bin/startxfce4" ] && [ -d "$rootfs/usr/share/kasmvnc" ]; } \
     || { msg "the desktop stack isn't in box '$prof' yet — rebuild it: ab remove $prof && ab $prof" "$Y"; return 1; }
   tmux has-session -t "=ab-boxgui" 2>/dev/null \
-    && { msg "a box desktop is already running (one at a time) — stop it: ab remove $prof" "$Y"; return 1; }
+    && { msg "a box desktop is already running (one at a time) — close it first: ab stop" "$Y"; return 1; }
   pw=$(gui_randpw)
   mkdir -p "$rootfs/root/.vnc" "$rootfs/root/.config/code-server"
   # blacklist_threshold=100: every client arrives as 127.0.0.1 and each page-load counts as a failed attempt — the
@@ -306,7 +306,7 @@ EOS
     || kv "  VS Code" "http://localhost:$GUI_BOXCODE" "$G"
   [ "$mitm" = 1 ] && kv "  mitmweb UI" "http://localhost:8083 (open in the box browser)" "$Y"
   kv "  password (both)" "$pw" "$G"
-  msg "  stop / drop the box: ab remove $prof" "$Y"; return 0; }
+  msg "  close it: ab stop   ·   delete + rebuild fresh: ab remove $prof" "$Y"; return 0; }
 # Every box gets a colourful interactive shell: colour ls/grep + a colour prompt, TERM defaulted to 256-colour. Written
 # host-side into the rootfs (idempotent) so it also fixes EXISTING boxes on the next launch — no rebuild needed.
 boxcolour(){ local r="$1"; [ -d "$r/etc" ] || return 0; mkdir -p "$r/etc/profile.d"
