@@ -7,6 +7,7 @@
 !/agentbox
 !/install.sh
 !/templates/
+!/CHANGELOG.md
 
 # Secrets & runtime state — never commit, even if the allowlist above is loosened.
 # (Last match wins, so these override any "!/..." re-inclusion.)
