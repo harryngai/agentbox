@@ -1,6 +1,6 @@
 #!/data/data/com.termux/files/usr/bin/bash
 # Version — single source of truth; the installer greps ^VERSION= (keep the line bare, no trailing comment).
-VERSION=3.13.0
+VERSION=3.14.0
 # agentbox — throwaway, folder-scoped AI-agent boxes for a phone (Android Termux + proot-distro ONLY).
 #
 # THREAT MODEL: this protects YOUR FILES from *accidents* (an agent touching the wrong folder), not from a hostile
@@ -156,6 +156,7 @@ aboxdefault(){ local path="$1" name="$2" src="$TPL/$2.conf"   # NB: $2, not $nam
     msg "no '$name' template found — seeded $(short "$path") from the built-in default, which is a CLAUDE box. If you expected a shipped template ('$name'), run 'ab update' to (re)fetch it, then: ab remove $name && ab $name" "$Y"
   fi; }
 aboxdrop(){ local a="$1" r; [ -n "$a" ] || return 0     # delete a built box (by alias); dir-remove as a fallback
+  pkill -9 -f "$a" 2>/dev/null                          # kill any leftover proot procs holding it, else remove/install says 'busy'
   proot-distro remove "$a" 2>/dev/null
   r=$(pdroot "$a"); [ -z "$r" ] || rm -rf "${r%/rootfs}"; }
 # Simple mode: with no INSTALL in the conf, generate the build steps from AGENT (+ extra PKGS). Docker mode (the conf
@@ -225,6 +226,10 @@ aboxguistop(){ local prof; prof=$(cat "$STATE/boxgui.prof" 2>/dev/null)
     cf=$(aboxconf "$prof"); [ -f "$cf" ] && . "$cf"
     [ "$EPHEMERAL" = 1 ] && aboxdrop "$(aboxalias "$prof")" && msg "throwaway box '$prof' deleted — next launch is fresh" "$Y"; fi
   anysession || { [ "$(wakestat)" = on ] && wakeoff; }; return 0; }
+# `ab stop` — close the running box desktop. Keeps the box (so reopening is instant, no rebuild) unless it's EPHEMERAL=1,
+# which aboxguistop then deletes. To force a fresh rebuild instead, use `ab remove <name>`.
+boxstop(){ tmux has-session -t "=ab-boxgui" 2>/dev/null || { msg "no box desktop is running" "$Y"; return 0; }
+  aboxguistop; msg "box desktop stopped" "$G"; }
 # If <prof>'s desktop is the one currently running, stop it before we delete/rebuild its rootfs (proot is userspace —
 # rm -rf under a live session would corrupt it and orphan the session + wakelock).
 aboxguard(){ [ -f "$STATE/boxgui.prof" ] && [ "$(cat "$STATE/boxgui.prof" 2>/dev/null)" = "$1" ] \
@@ -286,9 +291,9 @@ EOS
   # Launch via bash -c '…"$2"…' _ "$alias" "$PWD" "$tgt": the host path arrives as argv, expanded once, so any
   # space/$/quote/backtick in it stays literal (no re-parsed launch-script path).
   if [ "$mnt" = none ]; then
-    tmux new -ds ab-boxgui bash -c 'exec proot-distro login "$1" --isolated -- bash /root/.boxgui-run.sh' _ "$alias"
+    tmux new -ds ab-boxgui bash -c 'exec proot-distro login "$1" --isolated --kill-on-exit -- bash /root/.boxgui-run.sh' _ "$alias"
   else
-    tmux new -ds ab-boxgui bash -c 'exec proot-distro login "$1" --isolated --bind "$2:$3" -- bash /root/.boxgui-run.sh' _ "$alias" "$PWD" "$tgt"
+    tmux new -ds ab-boxgui bash -c 'exec proot-distro login "$1" --isolated --kill-on-exit --bind "$2:$3" -- bash /root/.boxgui-run.sh' _ "$alias" "$PWD" "$tgt"
   fi
   sleep 3
   tmux has-session -t "=ab-boxgui" 2>/dev/null \
@@ -847,6 +852,7 @@ usage(){
   row restore "<name>"    "restore that box from its snapshot"
   row remove  "<name>"    "delete the box rootfs + snapshot (also asks about the profile conf)"
   row rebuild "<name>"    "force-rebuild the box from its profile (keeps the snapshot)"
+  row stop    ""          "close the running box desktop — keeps the box (ab remove = delete + rebuild)"
   row "pkg <name>" "[add|rm|search]" "edit a simple profile's PKGS or search its apt catalog (rebuild to apply)"
   hd "▍Sessions" "(interactive 'ab <name>' opens a fresh one each launch; auto wakelock)"
   row session "[name]"    "no arg = list EVERY tmux session to reattach/kill"
@@ -869,7 +875,7 @@ usage(){
   hd "▍Notes"
   nt profile  "$(short "$VC")/profile/<name>.conf — AGENT·PKGS·TOKENS·RUN·MOUNT·EPHEMERAL·DESKTOP·APP·MITM·DIST  (docker: set INSTALL='…')"
   nt tokens   "$(short "$ENVF")  (0600; only a profile's TOKENS keys are injected; AGENTBOX_* excluded)"
-  nt reserved "save restore remove rebuild pkg setup update sync session help version ls list"
+  nt reserved "save restore remove rebuild stop pkg setup update sync session help version ls list"
   nt network  "shares the phone network — for a different exit IP use a whole-device Android VPN app"
   return 0
 }
@@ -883,6 +889,7 @@ case "${1:-}" in
   restore) shift; boxrestore "$@";;
   remove)  shift; boxremove "$@";;
   rebuild) shift; if [ -n "${1:-}" ]; then aboxbuild "$1" force; else msg "which box? ab rebuild <name>" "$Y"; fi;;
+  stop)    boxstop;;                              # close the running box desktop (keeps the box; ab remove = delete + rebuild)
   pkg)     shift; abpkg "$@";;
   setup)   setup;;
   update)  update;;
