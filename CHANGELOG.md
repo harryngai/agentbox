@@ -9,6 +9,9 @@ Versioning is `major.normal.minor`:
 
 `ab update` always pulls the latest from `main`, so `ab version` is the source of truth for what's deployed. Each box template also carries its own `# template-version:` stamp, bumped whenever that template's file changes; `ab` warns when your `~/.config/agentbox/box-<name>.conf` copy is behind the shipped template.
 
+## 3.14.2
+- **Fix a regression from 3.14.0:** the `--kill-on-exit` flag added to the desktop `proot-distro login` isn't accepted by proot-distro's `login`, so the desktop exited immediately ("box desktop exited immediately"). Reverted it. The original goal — killing the daemonised `Xvnc`/`chromium`/`mitmweb` that outlive the tmux session — is now done directly via `boxkillprocs`: it kills any process whose executable resolves inside the box rootfs (`/proc/<pid>/exe`), used by both `ab stop` and box deletion. Version-independent, no reliance on a proot-distro flag.
+
 ## 3.14.1
 - Desktop stop hints now point at `ab stop` (close, keep the box) instead of `ab remove` — the old "already running, stop it: ab remove <name>" even named the wrong box (the one you were launching, not the one running). Desktops stay one-at-a-time by design; switch with `ab stop` then `ab <other>`.
 

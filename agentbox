@@ -1,6 +1,6 @@
 #!/data/data/com.termux/files/usr/bin/bash
 # Version — single source of truth; the installer greps ^VERSION= (keep the line bare, no trailing comment).
-VERSION=3.14.1
+VERSION=3.14.2
 # agentbox — throwaway, folder-scoped AI-agent boxes for a phone (Android Termux + proot-distro ONLY).
 #
 # THREAT MODEL: this protects YOUR FILES from *accidents* (an agent touching the wrong folder), not from a hostile
@@ -155,8 +155,14 @@ aboxdefault(){ local path="$1" name="$2" src="$TPL/$2.conf"   # NB: $2, not $nam
   else ( umask 077; builtin_default_profile > "$path" )   # no valid template → the built-in default (a CLAUDE box)
     msg "no '$name' template found — seeded $(short "$path") from the built-in default, which is a CLAUDE box. If you expected a shipped template ('$name'), run 'ab update' to (re)fetch it, then: ab remove $name && ab $name" "$Y"
   fi; }
+# Kill every process whose executable lives inside a box's rootfs — daemonised Xvnc/chromium/mitmweb outlive the tmux
+# session (proot is ptrace-based, not a chroot, so /proc/<pid>/exe still resolves to the real rootfs path). Host-side.
+boxkillprocs(){ local rootfs="$1" p exe; [ -n "$rootfs" ] && [ -d "$rootfs" ] || return 0
+  for p in /proc/[0-9]*; do exe=$(readlink "$p/exe" 2>/dev/null)
+    case "$exe" in "$rootfs"/*) kill -9 "${p#/proc/}" 2>/dev/null;; esac; done; }
 aboxdrop(){ local a="$1" r; [ -n "$a" ] || return 0     # delete a built box (by alias); dir-remove as a fallback
-  pkill -9 -f "$a" 2>/dev/null                          # kill any leftover proot procs holding it, else remove/install says 'busy'
+  r=$(pdroot "$a"); [ -n "$r" ] && boxkillprocs "$r"     # kill procs running out of this rootfs, else remove/install says 'busy'
+  pkill -9 -f "$a" 2>/dev/null                          # and the proot wrapper itself (its argv holds the alias)
   proot-distro remove "$a" 2>/dev/null
   r=$(pdroot "$a"); [ -z "$r" ] || rm -rf "${r%/rootfs}"; }
 # Simple mode: with no INSTALL in the conf, generate the build steps from AGENT (+ extra PKGS). Docker mode (the conf
@@ -220,8 +226,10 @@ aboxbuild(){ local prof="$1" force="${2:-}" cf alias rootfs DIST="$DIST" \
   else rm -f "$rootfs/root/.abbuild.sh" "$rootfs/root/.gui-install.sh"; msg "build failed for '$prof' (see output above)" "$R"; return 1; fi; }
 # Stop the running box desktop (session ab-boxgui); a throwaway (EPHEMERAL=1) desktop box is deleted on stop so
 # its next launch is genuinely fresh (this is where EPHEMERAL is honoured for desktop boxes).
-aboxguistop(){ local prof; prof=$(cat "$STATE/boxgui.prof" 2>/dev/null)
-  tmux kill-session -t "=ab-boxgui" 2>/dev/null; rm -f "$STATE/boxgui.prof"
+aboxguistop(){ local prof rootfs; prof=$(cat "$STATE/boxgui.prof" 2>/dev/null)
+  [ -n "$prof" ] && rootfs=$(pdroot "$(aboxalias "$prof")")
+  tmux kill-session -t "=ab-boxgui" 2>/dev/null; boxkillprocs "$rootfs"   # Xvnc/chromium/mitmweb daemons don't die with the session
+  rm -f "$STATE/boxgui.prof"
   if [ -n "$prof" ]; then local cf INSTALL TOKENS RUN MOUNT EPHEMERAL=0 DESKTOP APP MITM AGENT PKGS DIST
     cf=$(aboxconf "$prof"); [ -f "$cf" ] && . "$cf"
     [ "$EPHEMERAL" = 1 ] && aboxdrop "$(aboxalias "$prof")" && msg "throwaway box '$prof' deleted — next launch is fresh" "$Y"; fi
@@ -291,9 +299,9 @@ EOS
   # Launch via bash -c '…"$2"…' _ "$alias" "$PWD" "$tgt": the host path arrives as argv, expanded once, so any
   # space/$/quote/backtick in it stays literal (no re-parsed launch-script path).
   if [ "$mnt" = none ]; then
-    tmux new -ds ab-boxgui bash -c 'exec proot-distro login "$1" --isolated --kill-on-exit -- bash /root/.boxgui-run.sh' _ "$alias"
+    tmux new -ds ab-boxgui bash -c 'exec proot-distro login "$1" --isolated -- bash /root/.boxgui-run.sh' _ "$alias"
   else
-    tmux new -ds ab-boxgui bash -c 'exec proot-distro login "$1" --isolated --kill-on-exit --bind "$2:$3" -- bash /root/.boxgui-run.sh' _ "$alias" "$PWD" "$tgt"
+    tmux new -ds ab-boxgui bash -c 'exec proot-distro login "$1" --isolated --bind "$2:$3" -- bash /root/.boxgui-run.sh' _ "$alias" "$PWD" "$tgt"
   fi
   sleep 3
   tmux has-session -t "=ab-boxgui" 2>/dev/null \
