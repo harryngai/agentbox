@@ -1,6 +1,6 @@
 #!/data/data/com.termux/files/usr/bin/bash
 # Version — single source of truth; the installer greps ^VERSION= (keep the line bare, no trailing comment).
-VERSION=3.11.1
+VERSION=3.11.2
 # agentbox — throwaway, folder-scoped AI-agent boxes for a phone (Android Termux + proot-distro ONLY).
 #
 # THREAT MODEL: this protects YOUR FILES from *accidents* (an agent touching the wrong folder), not from a hostile
@@ -796,11 +796,11 @@ update(){ { has curl || has wget; } || { msg "need curl or wget to update" "$R";
 # CY·BD = section header, G = reserved for status ("built"/"ready"), DM = notes. WIDE (set in usage,
 # visible here via bash dynamic scope) picks a 2-column layout on wide terminals and a stacked one on
 # a narrow phone screen so descriptions get a clean hang-indent instead of wrapping to column 0.
-row(){ local n
+row(){ local n c1="$BD"; case "$1" in '<'*|'['*) c1="$Y";; esac   # a <placeholder>/[arg] name isn't a literal command → yellow
   if [ "${WIDE:-1}" = 1 ]; then n=$((30-$(dw "$1${2:+ $2}"))); ((n<1)) && n=1
-    printf '  %s%s%s%s%*s%s\n' "$BD" "$1" "${2:+ $Y$2}" "$Z" "$n" '' "$3"
+    printf '  %s%s%s%s%*s%s\n' "$c1" "$1" "${2:+ $Y$2}" "$Z" "$n" '' "$3"
   elif [ -z "$1$2" ]; then printf '      %s\n' "$3"      # continuation line (empty command)
-  else printf '  %s%s%s%s\n      %s\n' "$BD" "$1" "${2:+ $Y$2}" "$Z" "$3"; fi; }
+  else printf '  %s%s%s%s\n      %s\n' "$c1" "$1" "${2:+ $Y$2}" "$Z" "$3"; fi; }
 hd(){ printf '\n%s%s%s' "$CY$BD" "$1" "$Z"
   [ -n "${2:-}" ] && { [ "${WIDE:-1}" = 1 ] && printf '  %s%s%s' "$DM" "$2" "$Z" || printf '\n  %s%s%s' "$DM" "$2" "$Z"; }
   printf '\n'; }
