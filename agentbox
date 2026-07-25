@@ -1,6 +1,6 @@
 #!/data/data/com.termux/files/usr/bin/bash
 # Version — single source of truth; the installer greps ^VERSION= (keep the line bare, no trailing comment).
-VERSION=3.15.0
+VERSION=3.16.0
 # agentbox — throwaway, folder-scoped AI-agent boxes for a phone (Android Termux + proot-distro ONLY).
 #
 # THREAT MODEL: this protects YOUR FILES from *accidents* (an agent touching the wrong folder), not from a hostile
@@ -548,6 +548,36 @@ tmuxconf(){ local f=~/.tmux.conf force="${1:-}"
   tmux info >/dev/null 2>&1 && tmux source-file "$f" 2>/dev/null
   [ "$force" != force ] || msg "tmux config applied → $f (mouse off, passthrough, extended keys; first run backs up to $f.bak)" "$G"
   return 0; }
+# After an abrupt ssh DROP (not a clean tmux detach) the box's TUI leaves the OUTER terminal in mouse-report /
+# bracketed-paste mode — tmux never got to restore it — so on reconnect you land at the HOST shell and every mouse move
+# spills escape codes into the command line. Self-heal: a PROMPT_COMMAND that disables those modes before each host
+# prompt (outside tmux only — inside, tmux + the app own that state; a no-op when nothing leaked, so it's invisible).
+# Idempotent managed block in ~/.bashrc, plus a ~/.bash_profile bridge because ssh gives a LOGIN shell, which sources
+# .bash_profile and SKIPS .bashrc — without the bridge the heal would never load over ssh (exactly the case that leaks).
+hostheal(){ local rc=~/.bashrc bp=~/.bash_profile
+  if ! grep -q '#AGENTBOX-HEAL v1' "$rc" 2>/dev/null; then
+    [ -f "$rc" ] && [ ! -f "$rc.bak" ] && cp "$rc" "$rc.bak"
+    [ -f "$rc" ] && sed -i -e '/^#AGENTBOX-HEAL/,/^#AGENTBOX-HEAL-END/d' "$rc" 2>/dev/null
+    cat >> "$rc" <<'ABH'
+#AGENTBOX-HEAL v1 (managed) — clear leaked mouse/paste modes at each host prompt after an ssh drop
+if [ -n "$PS1" ] && [ -t 1 ] && [ -z "$TMUX" ]; then
+  __ab_termheal(){ printf '\033[?1000l\033[?1002l\033[?1003l\033[?1006l\033[?2004l\033[?1004l\033[?25h'; }
+  case ";$PROMPT_COMMAND;" in *";__ab_termheal;"*) :;; *) PROMPT_COMMAND="__ab_termheal${PROMPT_COMMAND:+;$PROMPT_COMMAND}";; esac
+fi
+#AGENTBOX-HEAL-END
+ABH
+  fi
+  if ! grep -q 'agentbox-heal-bridge' "$bp" 2>/dev/null; then
+    if [ ! -f "$bp" ]; then                                      # no .bash_profile → make one that keeps .profile working
+      cat > "$bp" <<'ABB'
+# agentbox-heal-bridge — login (ssh) shells skip ~/.bashrc; load ~/.profile then ~/.bashrc so the terminal heal applies
+[ -f ~/.profile ] && . ~/.profile
+[ -f ~/.bashrc ] && . ~/.bashrc
+ABB
+    elif ! grep -q '\.bashrc' "$bp"; then                        # it exists but never sources .bashrc → add a guarded line
+      printf '\n[ -f ~/.bashrc ] && . ~/.bashrc  # agentbox-heal-bridge\n' >> "$bp"
+    fi
+  fi; return 0; }
 needtmux(){ has tmux || pkg install -y tmux || { msg "tmux is required but not available" "$R"; return 1; }; tmuxconf; }
 anysession(){ tmux ls -F '#S' 2>/dev/null | grep -q '^ab-'; }
 # A session pane re-runs `bash "$SELF" …`; if the on-disk script won't parse, the pane dies the instant it starts —
@@ -584,6 +614,7 @@ slug(){ local s; s=$(printf '%s' "${1##*/}" | tr '[:upper:]' '[:lower:]' | tr -c
 # A `host-*` name opens a plain HOST shell (no box, no proot) — still an ab-* session so it lists/kills/wakelocks the same.
 sessrun(){ local prof="$1"; shift; local s base
   needtmux || return 1
+  hostheal                                                       # install the host-shell terminal self-heal (idempotent)
   [ "${prof#host-}" = "$prof" ] && { selfok || return 1; }      # box pane re-runs $SELF; host pane doesn't, so skip the parse gate
   [ "$(wakestat)" = on ] || wakeon || true
   base="ab-$(slug "$prof")-$(slug "$PWD")"
@@ -757,7 +788,7 @@ sshauth(){ local sc="$PREFIX/etc/ssh/sshd_config" pa=yes
   if [ "$pa" = no ]; then msg "ssh key enrolled — password login off (key-only)" "$G"
   else msg "no ssh key enrolled yet — password login on; from the computer: ssh-copy-id -p 8022 <phone-ip>" "$Y"; fi; }
 # Phone side: font → extra-keys → mirror → upgrade → sshd (8022) → wakelock → link.
-initphone(){ fontinstall; termuxprops
+initphone(){ fontinstall; termuxprops; hostheal
   has termux-reload-settings && termux-reload-settings
   if [ -t 0 ]; then termux-change-repo; else msg "non-interactive — skipping termux-change-repo" "$Y"; fi
   pkg update -y || return 1
@@ -806,7 +837,7 @@ unkill(){ local t="${AGENTBOX_TTY:-/dev/tty}" pport cport code v
 setup(){ local t="${AGENTBOX_TTY:-/dev/tty}" ans i=0 tot cmd title why rest s; local -a steps
   steps=(
     "links|put agentbox on PATH|Creates the ab / agentbox commands in \$PREFIX/bin (only runs if they're missing)."
-    "init|set up Termux|Glyph font + extra-keys row (⇧⇥/arrows), updates Termux, installs proot-distro, and starts sshd on 8022."
+    "init|set up Termux|Glyph font + extra-keys row (⇧⇥/arrows), updates Termux, installs proot-distro, starts sshd on 8022, and self-heals the host shell after an ssh drop (no more mouse-code spill)."
     "tmux|tmux config|Applies the managed tmux config (mouse off + TUI-friendly keys)."
     "unkill|stop Android killing the box|Disables the phantom-process killer via on-device adb (Android 12+, guided)."
     "env|add your API tokens|You'll be asked for each token in turn; press Enter to leave one unchanged."

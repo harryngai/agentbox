@@ -9,6 +9,9 @@ Versioning is `major.normal.minor`:
 
 `ab update` always pulls the latest from `main`, so `ab version` is the source of truth for what's deployed. Each box template also carries its own `# template-version:` stamp, bumped whenever that template's file changes; `ab` warns when your `~/.config/agentbox/box-<name>.conf` copy is behind the shipped template.
 
+## 3.16.0
+- **Host-shell terminal self-heal after an ssh drop.** When a box's TUI agent (Claude Code, etc.) has mouse tracking / bracketed paste on and the ssh connection *drops* (rather than detaching cleanly), tmux never gets to restore the outer terminal — so on reconnect you land at the Termux host shell and every mouse move spills escape codes (`\e[<…M`) straight into the command line. agentbox now installs a managed `PROMPT_COMMAND` block in `~/.bashrc` that disables those modes (mouse 1000/1002/1003/1006, bracketed paste 2004, focus 1004, cursor) before each **host** prompt — outside tmux only, and a silent no-op when nothing leaked. Because ssh opens a *login* shell (which sources `.bash_profile` and skips `.bashrc`), a `~/.bash_profile` bridge is added too so the heal actually loads over ssh. Installed by `ab setup` (the "set up Termux" step) and on every `ab <name>` session open; idempotent, backs `~/.bashrc` up once to `.bashrc.bak`. Reattaching a session (`ab session`) already worked — this covers the "reconnect straight to the host shell" path.
+
 ## 3.15.0
 - **`ab pw <name> [password]`** — set (or show) a desktop box's login password instead of the random one generated each launch. Stored 0600 at `~/.config/agentbox/gui-<name>.pw`; applies on the next launch.
 - **`LAN=1`** profile option (desktop boxes) — also serve the KasmVNC desktop on your Wi-Fi (`http://<phone-ip>:6902`), not just localhost. Default `0` (localhost only). mitmweb stays local. The desktop is password-protected; set a strong one with `ab pw` before exposing it.
