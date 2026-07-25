@@ -1,6 +1,6 @@
 #!/data/data/com.termux/files/usr/bin/bash
 # Version — single source of truth; the installer greps ^VERSION= (keep the line bare, no trailing comment).
-VERSION=3.19.0
+VERSION=3.20.0
 # agentbox — throwaway, folder-scoped AI-agent boxes for a phone (Android Termux + proot-distro ONLY).
 #
 # THREAT MODEL: this protects YOUR FILES from *accidents* (an agent touching the wrong folder), not from a hostile
@@ -30,6 +30,7 @@ pdroot(){ local n="${1:-$DIST}" d; for d in "$PDLIB/containers/$n/rootfs" "$PDLI
   [ -z "$d" ] && return 0; [ -d "$d/rootfs" ] && echo "$d/rootfs" || echo "$d"; }
 VC="$CFG"; ENVF="$VC/agent.env"   # secrets file: host-side, mode 600, values injected per-profile (never the file itself).
 GUI_BOXWEB=6902; GUI_BOXCODE=8081   # a DESKTOP= box's scoped KasmVNC + code-server ports (localhost).
+GUI_BOXRFB=5901                     # …and its plain-VNC port when RFB=1 (native viewers; localhost unless LAN=1).
 AGBASE="${AGENTBOX_BASE:-https://raw.githubusercontent.com/harryngai/agentbox/main}"   # installer base (ab update).
 RCONF="$VC/rclone.conf"; RREMOTE="${AGENTBOX_REMOTE:-dropbox}"; RFILTER="$VC/rclone-filter.txt"   # sync (rclone bisync).
 
@@ -146,6 +147,7 @@ tpldesc(){ ( . "$1" 2>/dev/null; local d
   elif [ -z "$RUN" ]; then d="$AGENT installed, opens a shell"
   else d="runs $RUN"; fi
   [ "${MITM:-0}" = 1 ] && d="$d · MITM"
+  [ "${RFB:-0}" = 1 ] && d="$d · RFB"
   [ -n "${GPU:-}" ] && d="$d · $GPU GPU"
   [ "${EPHEMERAL:-0}" = 1 ] && d="$d · throwaway"
   [ "${MOUNT:-cwd}" = none ] && d="$d · sealed"
@@ -222,7 +224,7 @@ GH
 # Build the box for profile <name> from its conf: base (apt update + curl + ca-certificates + install-node helper),
 # then INSTALL (docker mode) or the AGENT/PKGS recipe (simple mode), then mitmproxy (MITM=1), then the desktop (DESKTOP).
 aboxbuild(){ local prof="$1" force="${2:-}" cf alias rootfs DIST="$DIST" \
-    INSTALL= TOKENS= RUN= MOUNT=cwd EPHEMERAL=0 DESKTOP= APP=code MITM=0 LAN=0 GPU= AGENT=none PKGS=
+    INSTALL= TOKENS= RUN= MOUNT=cwd EPHEMERAL=0 DESKTOP= APP=code MITM=0 LAN=0 RFB=0 GPU= AGENT=none PKGS=
   cf=$(aboxconf "$prof"); alias=$(aboxalias "$prof"); [ -f "$cf" ] && . "$cf"; DIST="${DIST:-debian}"
   [ -n "$INSTALL" ] || INSTALL=$(agent_recipe "$AGENT" "$PKGS") \
     || { msg "profile '$prof': unknown AGENT '$AGENT' (use claude|codex|copilot|none)" "$R"; return 1; }
@@ -249,7 +251,7 @@ aboxbuild(){ local prof="$1" force="${2:-}" cf alias rootfs DIST="$DIST" \
 # recipe so the CLI agent + apt packages move to latest, WITHOUT deleting the rootfs (no re-download). Sits between
 # `ab update` (updates agentbox itself, never box contents) and `ab rebuild` (wipes + reinstalls). Docker-mode boxes
 # (INSTALL set in the conf) re-run those steps verbatim; the desktop stack is untouched — rebuild for that.
-boxupgrade(){ local prof="${1:-}" alias rootfs cf INSTALL= TOKENS= RUN= MOUNT=cwd EPHEMERAL=0 DESKTOP= APP=code MITM=0 LAN=0 GPU= AGENT=none PKGS= DIST=
+boxupgrade(){ local prof="${1:-}" alias rootfs cf INSTALL= TOKENS= RUN= MOUNT=cwd EPHEMERAL=0 DESKTOP= APP=code MITM=0 LAN=0 RFB=0 GPU= AGENT=none PKGS= DIST=
   [ -n "$prof" ] || { msg "which box? ab upgrade <name>" "$Y"; return 1; }
   alias=$(aboxalias "$prof"); rootfs=$(pdroot "$alias")
   [ -n "$rootfs" ] || { msg "box '$prof' isn't built yet — nothing to upgrade; run it first: ab run $prof" "$Y"; return 1; }
@@ -271,7 +273,7 @@ aboxguistop(){ local prof rootfs; prof=$(cat "$STATE/boxgui.prof" 2>/dev/null)
   [ -n "$prof" ] && rootfs=$(pdroot "$(aboxalias "$prof")")
   tmux kill-session -t "=ab-boxgui" 2>/dev/null; boxkillprocs "$rootfs"   # Xvnc/chromium/mitmweb daemons don't die with the session
   rm -f "$STATE/boxgui.prof"
-  if [ -n "$prof" ]; then local cf INSTALL TOKENS RUN MOUNT EPHEMERAL=0 DESKTOP APP MITM LAN GPU AGENT PKGS DIST
+  if [ -n "$prof" ]; then local cf INSTALL TOKENS RUN MOUNT EPHEMERAL=0 DESKTOP APP MITM LAN RFB GPU AGENT PKGS DIST
     cf=$(aboxconf "$prof"); [ -f "$cf" ] && . "$cf"
     [ "$EPHEMERAL" = 1 ] && aboxdrop "$(aboxalias "$prof")" && msg "throwaway box '$prof' deleted — next launch is fresh" "$Y"; fi
   anysession || { [ "$(wakestat)" = on ] && wakeoff; }; return 0; }
@@ -324,13 +326,31 @@ boxgl(){ local rootfs="$1" alias="$2" f
     apt-get update -qq && apt-get install -y --no-install-recommends libgl1-mesa-dri mesa-utils' >/dev/null 2>&1 \
     || { msg "  GPU=virgl: mesa install failed (network?) — desktop continues on CPU" "$Y"; return 1; }
   return 0; }
+# ── RFB=1 (desktop boxes): a native-VNC door beside the browser one ─
+# WHY: KasmVNC deliberately broke from the RFB spec and serves only its own browser client, and that client maps touch
+# ABSOLUTELY — your finger IS the pointer, so a tap lands where you touched and there is no trackpad mode (upstream
+# noVNC has an open request for one, #1764). Native Android viewers do have it — AVNC's 'Gesture style: Touchpad',
+# bVNC's 'Simulated Touchpad' — but they speak plain RFB, which KasmVNC will not answer. RFB=1 runs x11vnc alongside,
+# attached to the SAME X display :1, so one desktop has two doors: the browser on $GUI_BOXWEB, a trackpad-capable app
+# on $GUI_BOXRFB. Same password, same session, same pixels — pick whichever input model suits the moment.
+# NOTE classic VNC auth is a single shared password (no user) and its DES scheme reads only the first 8 characters —
+# hence localhost-only unless LAN=1, exactly like the web client.
+# Installed at LAUNCH, not build, so desktop boxes made before this release pick it up without a rebuild. Idempotent.
+boxrfb(){ local rootfs="$1" alias="$2"
+  [ -x "$rootfs/usr/bin/x11vnc" ] && return 0
+  msg "  RFB=1 → adding x11vnc to the box (one-off apt)…" "$Y"
+  proot-distro login "$alias" --isolated -- bash -c 'export DEBIAN_FRONTEND=noninteractive
+    apt-get update -qq && apt-get install -y --no-install-recommends x11vnc' >/dev/null 2>&1
+  [ -x "$rootfs/usr/bin/x11vnc" ] && return 0
+  msg "  RFB=1: x11vnc install failed (network?) — the web desktop still opens" "$Y"; return 1; }
 # Scoped desktop for a DESKTOP=xfce box: KasmVNC + (code-server for APP=code, or chromium for APP=browser) inside the
 # box. Own ports (6902/8081, localhost); one box desktop at a time (session ab-boxgui). Fresh random password each
 # start, printed. MOUNT=none binds nothing (SEALED); otherwise the cwd opens as /work-<cwd>. MITM=1 routes chromium
 # through mitmweb (CA trusted into the box's nssdb, proxy flag added). GPU=virgl renders GL on the phone's GPU through
-# the Termux-side vtest server (see virglsock), degrading to CPU if anything about that is unavailable.
-aboxgui(){ local prof="$1" alias="$2" rootfs="$3" app="${4:-code}" mnt="${5:-cwd}" mitm="${6:-0}" lan="${7:-0}" gpu="${8:-}" \
-    pw tgt geo iface=127.0.0.1 lip= sock= gbind= gpuenv=
+# the Termux-side vtest server (see virglsock), degrading to CPU if anything about that is unavailable. RFB=1 mirrors
+# the same display onto a plain-VNC port for native viewers (see boxrfb), degrading to web-only if x11vnc won't run.
+aboxgui(){ local prof="$1" alias="$2" rootfs="$3" app="${4:-code}" mnt="${5:-cwd}" mitm="${6:-0}" lan="${7:-0}" gpu="${8:-}" rfb="${9:-0}" \
+    pw tgt geo iface=127.0.0.1 lip= sock= gbind= gpuenv= rfbbind=-localhost i=
   [ "$lan" = 1 ] && iface=0.0.0.0                              # LAN=1 → bind KasmVNC/code-server to all interfaces (mitmweb stays local)
   needtmux || return 1
   { [ -x "$rootfs/usr/bin/startxfce4" ] && [ -d "$rootfs/usr/share/kasmvnc" ]; } \
@@ -340,6 +360,11 @@ aboxgui(){ local prof="$1" alias="$2" rootfs="$3" app="${4:-code}" mnt="${5:-cwd
   # GPU=virgl: start/locate the Termux-side vtest server and make sure the box has mesa's virgl client. EVERY failure
   # degrades to CPU rendering with a warning — a GPU problem must never cost you the desktop.
   if [ "$gpu" = virgl ]; then sock=$(virglsock) || sock=; [ -n "$sock" ] && { boxgl "$rootfs" "$alias" || sock=; }; fi
+  # RFB=1: make sure x11vnc is in the box, and clear last run's verdict markers so the summary reports THIS launch.
+  # A failed install is NOT special-cased: the in-box script then finds no x11vnc, writes .rfb.fail, and the summary
+  # reports web-only from that one source of truth rather than from two half-agreeing flags.
+  [ "$rfb" = 1 ] && { boxrfb "$rootfs" "$alias"; rm -f "$rootfs/root/.rfb.ok" "$rootfs/root/.rfb.fail"; }
+  [ "$lan" = 1 ] && rfbbind=                                   # LAN=1 → x11vnc listens on every interface too (default)
   pw=$(cat "$VC/gui-$prof.pw" 2>/dev/null); [ -n "$pw" ] || pw=$(gui_randpw)   # a fixed password (ab pw <name>) wins, else random
   mkdir -p "$rootfs/root/.vnc" "$rootfs/root/.config/code-server"
   # blacklist_threshold=100: every client arrives as 127.0.0.1 and each page-load counts as a failed attempt — the
@@ -369,6 +394,20 @@ $gpuenv
 vncserver -kill :1 >/dev/null 2>&1 || true
 rm -f /tmp/.X1-lock /tmp/.X11-unix/X1
 vncserver :1 -geometry "$geo" -depth 24 -noreset || exit 1
+EOS
+    # RFB=1: x11vnc exports the SAME display :1 as plain VNC, so the browser client and a native viewer drive one
+    # desktop. It needs its own password file (the classic DES format, which KasmVNC's own auth no longer uses); if
+    # that file didn't get written we do NOT start — better no port at all than an unauthenticated one. The marker
+    # files are the launch summary's source of truth, so it can never claim a port that isn't listening.
+    [ "$rfb" = 1 ] && cat <<EOS
+(umask 077; rm -f /root/.vnc/x11vnc.pass    # delete first: a stale file would open the port on LAST launch's password
+ x11vnc -storepasswd "\$PW" /root/.vnc/x11vnc.pass >/dev/null 2>&1)
+XA=; [ -f /root/.Xauthority ] && XA="-auth /root/.Xauthority"
+if [ -s /root/.vnc/x11vnc.pass ] && x11vnc -display :1 \$XA -rfbport $GUI_BOXRFB $rfbbind \\
+     -rfbauth /root/.vnc/x11vnc.pass -forever -shared -bg -q -o /tmp/x11vnc.log >/dev/null 2>&1; then
+  sleep 1
+  if command -v pgrep >/dev/null 2>&1 && ! pgrep -x x11vnc >/dev/null 2>&1; then : > /root/.rfb.fail; else : > /root/.rfb.ok; fi
+else : > /root/.rfb.fail; fi
 EOS
     [ "$mitm" = 1 ] && cat <<'EOS'
 mitmweb --mode regular --listen-host 127.0.0.1 --listen-port 8082 --web-host 127.0.0.1 --web-port 8083 --set web_open_browser=false >/tmp/mitmweb.log 2>&1 &
@@ -407,17 +446,31 @@ EOS
   tmux has-session -t "=ab-boxgui" 2>/dev/null \
     || { msg "box desktop exited immediately — rebuild the box: ab remove $prof && ab $prof" "$R"; return 1; }
   mkdir -p "$STATE"; printf '%s' "$prof" > "$STATE/boxgui.prof"
+  # RFB=1: the in-box script writes its verdict only once Xvnc is up, which can land a few seconds past the sleep above.
+  [ "$rfb" = 1 ] && for i in $(seq 1 10); do
+    { [ -e "$rootfs/root/.rfb.ok" ] || [ -e "$rootfs/root/.rfb.fail" ]; } && break; sleep 1; done
   [ "$mnt" = none ] && msg "box desktop '$prof' started — SEALED (no folder bound):" "$G" \
     || msg "box desktop '$prof' started — scoped to $(short "$PWD") (opens as $tgt):" "$G"
   kv "  desktop (KasmVNC)" "http://localhost:$GUI_BOXWEB  (login user: agent)" "$G"
   [ "$lan" = 1 ] && { lip=$(lanips | awk '{print $1}'); [ -n "$lip" ] && kv "  on your LAN" "http://$lip:$GUI_BOXWEB  (anyone on this Wi-Fi, same password)" "$Y"; }
+  if [ "$rfb" = 1 ]; then
+    if [ -e "$rootfs/root/.rfb.ok" ]; then
+      kv "  native VNC (RFB)" "127.0.0.1:$GUI_BOXRFB  — same desktop, for a viewer with a trackpad mode" "$G"
+      kv "  ↳ trackpad mode" "AVNC: Settings → Gesture style → Touchpad  ·  bVNC: input mode → Simulated Touchpad" "$G"
+      [ "$lan" = 1 ] && [ -n "$lip" ] && kv "  ↳ on your LAN" "$lip:$GUI_BOXRFB  (anyone on this Wi-Fi — and VNC auth is 8-char DES, weaker than the web login)" "$Y"
+    else kv "  native VNC (RFB)" "asked for, but x11vnc isn't running — web desktop only (why: the warning above, or /tmp/x11vnc.log in the box)" "$Y"; fi
+  fi
   [ "$app" = browser ] && kv "  browser" "chromium (opens in the desktop; reopen from the menu if closed)" "$G" \
     || kv "  VS Code" "http://localhost:$GUI_BOXCODE" "$G"
   [ "$mitm" = 1 ] && kv "  mitmweb UI" "http://localhost:8083 (open in the box browser)" "$Y"
   [ "$gpu" = virgl ] && { [ -n "$sock" ] \
     && kv "  GPU" "virgl → the phone's GPU (check in a desktop terminal: glxinfo -B)" "$G" \
     || kv "  GPU" "virgl asked for but unavailable — running on CPU (llvmpipe)" "$Y"; }
-  kv "  password (both)" "$pw" "$G"
+  # One password for every door. Classic VNC auth (the RFB port) is DES over the first 8 characters only — say so
+  # rather than let a 16-char password look like it was rejected/truncated by the viewer.
+  [ "$rfb" = 1 ] && [ -e "$rootfs/root/.rfb.ok" ] \
+    && kv "  password (all 3)" "$pw   (the RFB port reads only its first 8 characters — type the whole thing)" "$G" \
+    || kv "  password (both)" "$pw" "$G"
   kv "  close it" "ab stop  (keeps the box; reopen with ab $prof)" "$Y"
   kv "  rebuild fresh" "ab remove $prof  (delete, then ab $prof)" "$Y"; return 0; }
 # Every box gets a colourful interactive shell: colour ls/grep + a colour prompt, TERM defaulted to 256-colour. Written
@@ -438,7 +491,7 @@ ABC
     || printf '\n[ -f /etc/profile.d/agentbox-colour.sh ] && . /etc/profile.d/agentbox-colour.sh  # agentbox-colour\n' >> "$r/etc/bash.bashrc"; }
 # `ab <name> [cmd]` — build box <name> from its profile if missing, then run it scoped to the cwd.
 abox(){ local prof="$1"; shift; local cmd="$*" cf alias rootfs \
-    INSTALL= TOKENS= RUN= MOUNT=cwd EPHEMERAL=0 DESKTOP= APP=code MITM=0 LAN=0 GPU= AGENT= PKGS= DIST= ef efn rc tgt run incmd mitmblock= ms=
+    INSTALL= TOKENS= RUN= MOUNT=cwd EPHEMERAL=0 DESKTOP= APP=code MITM=0 LAN=0 RFB=0 GPU= AGENT= PKGS= DIST= ef efn rc tgt run incmd mitmblock= ms=
   case "$prof" in host-*)                                        # host-* is a host tmux session, never a box (no profile, no proot)
     if [ -z "$cmd" ] && [ -t 1 ] && [ -z "${TMUX:-}" ] && [ "${AB_NO_SESSION:-}" != 1 ]; then sessrun "$prof"; return $?; fi
     if [ -n "$cmd" ]; then exec "${SHELL:-bash}" -lc "$cmd"; else exec "${SHELL:-bash}" -l; fi;;
@@ -471,8 +524,11 @@ abox(){ local prof="$1"; shift; local cmd="$*" cf alias rootfs \
   case "${GPU:-}" in ''|virgl) :;;                               # GPU= is desktop-only and has exactly one value today
     *) msg "profile '$prof': unknown GPU='$GPU' (use virgl, or leave it empty for CPU) — ignoring" "$Y"; GPU=;; esac
   [ -n "$GPU" ] && [ -z "$DESKTOP" ] && { msg "note: GPU=$GPU applies to a DESKTOP box only — ignored here" "$Y"; GPU=; }
+  case "${RFB:-0}" in ''|0) RFB=0;; 1) :;;                       # RFB= is desktop-only and is a plain on/off
+    *) msg "profile '$prof': RFB must be 0 or 1 (got '$RFB') — ignoring" "$Y"; RFB=0;; esac
+  [ "$RFB" = 1 ] && [ -z "$DESKTOP" ] && { msg "note: RFB=1 applies to a DESKTOP box only — ignored here" "$Y"; RFB=0; }
   # DESKTOP set → run a scoped desktop (background); nothing after this runs for a GUI box.
-  [ -n "$DESKTOP" ] && { aboxgui "$prof" "$alias" "$rootfs" "$APP" "$MOUNT" "$MITM" "$LAN" "$GPU"; return $?; }
+  [ -n "$DESKTOP" ] && { aboxgui "$prof" "$alias" "$rootfs" "$APP" "$MOUNT" "$MITM" "$LAN" "$GPU" "$RFB"; return $?; }
   run="${cmd:-$RUN}"; [ "$MITM" = 1 ] && ms='; mitm on'
   ef="$rootfs/root/.abenv.$$"; efn=".abenv.$$"     # token file lives inside the isolated rootfs; nothing else is bound
   ( umask 077; aboxenv "$TOKENS" > "$ef" )
@@ -1035,9 +1091,10 @@ usage(){
     row "$(printf '%-7s' "$(basename "$tf" .conf)")" "v$(tplver "$tf")" "$(tpldesc "$tf")"
   done
   hd "▍Notes"
-  nt profile  "$(short "$VC")/profile/<name>.conf — AGENT·PKGS·TOKENS·RUN·MOUNT·EPHEMERAL·DESKTOP·APP·MITM·LAN·GPU·DIST  (docker: set INSTALL='…')"
+  nt profile  "$(short "$VC")/profile/<name>.conf — AGENT·PKGS·TOKENS·RUN·MOUNT·EPHEMERAL·DESKTOP·APP·MITM·LAN·RFB·GPU·DIST  (docker: set INSTALL='…')"
   nt new      "a name with no profile yet asks before creating the box — Enter = yes, n = cancel (AB_YES=1 skips the ask)"
   nt gpu      "GPU=virgl (desktop boxes) renders GL on the phone's GPU via a Termux-side server — opt-in, CPU if unavailable"
+  nt rfb      "RFB=1 (desktop boxes) also serves the SAME desktop as plain VNC on $GUI_BOXRFB — for a native viewer with a trackpad mode (AVNC · bVNC); the browser client is touch-absolute"
   nt tokens   "$(short "$ENVF")  (0600; only a profile's TOKENS keys are injected; AGENTBOX_* excluded)"
   nt reserved "run save restore remove rm rebuild upgrade stop pw pkg setup update sync session help version ls list"
   nt shadow   "a box whose name is a reserved word runs only via 'ab run <name>' — the 'ab <name>' shorthand is taken"
