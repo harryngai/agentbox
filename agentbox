@@ -1,6 +1,6 @@
 #!/data/data/com.termux/files/usr/bin/bash
 # Version — single source of truth; the installer greps ^VERSION= (keep the line bare, no trailing comment).
-VERSION=3.20.0
+VERSION=3.21.0
 # agentbox — throwaway, folder-scoped AI-agent boxes for a phone (Android Termux + proot-distro ONLY).
 #
 # THREAT MODEL: this protects YOUR FILES from *accidents* (an agent touching the wrong folder), not from a hostile
@@ -221,11 +221,18 @@ esac
 git config --system credential.https://github.com.helper '!gh auth git-credential'
 GH
   return 0; }
+# DESKTOP= names WHICH session, not just "on": xfce (minimal — session + wm only, the long-standing default) or kde
+# (a full Plasma desktop: fancy, and heavy). Anything else maps to xfce, so profiles from when the value was a label
+# nobody read keep building exactly as before. desession() is the in-box binary both the installer and the launcher
+# test for — one definition, so "did the stack install" and "what do we exec" can never disagree.
+dename(){ case "${1:-}" in kde|plasma|KDE|Plasma) echo kde;; *) echo xfce;; esac; }
+desession(){ [ "$(dename "${1:-}")" = kde ] && echo /usr/bin/startplasma-x11 || echo /usr/bin/startxfce4; }
 # Build the box for profile <name> from its conf: base (apt update + curl + ca-certificates + install-node helper),
 # then INSTALL (docker mode) or the AGENT/PKGS recipe (simple mode), then mitmproxy (MITM=1), then the desktop (DESKTOP).
-aboxbuild(){ local prof="$1" force="${2:-}" cf alias rootfs DIST="$DIST" \
+aboxbuild(){ local prof="$1" force="${2:-}" cf alias rootfs de=xfce DIST="$DIST" \
     INSTALL= TOKENS= RUN= MOUNT=cwd EPHEMERAL=0 DESKTOP= APP=code MITM=0 LAN=0 RFB=0 GPU= AGENT=none PKGS=
   cf=$(aboxconf "$prof"); alias=$(aboxalias "$prof"); [ -f "$cf" ] && . "$cf"; DIST="${DIST:-debian}"
+  de=$(dename "$DESKTOP")                                       # which session the desktop stack installs (xfce | kde)
   [ -n "$INSTALL" ] || INSTALL=$(agent_recipe "$AGENT" "$PKGS") \
     || { msg "profile '$prof': unknown AGENT '$AGENT' (use claude|codex|copilot|none)" "$R"; return 1; }
   { [ "$force" = force ] && [ -n "$(pdroot "$alias")" ]; } && { aboxguard "$prof"; aboxdrop "$alias"; }
@@ -235,13 +242,13 @@ aboxbuild(){ local prof="$1" force="${2:-}" cf alias rootfs DIST="$DIST" \
       || { msg "install failed — update proot-distro: pkg upgrade proot-distro" "$R"; return 1; }
   fi
   rootfs=$(pdroot "$alias"); [ -n "$rootfs" ] || { msg "box '$prof' rootfs not found" "$R"; return 1; }
-  [ -n "$DESKTOP" ] && { msg "  DESKTOP → installing the desktop stack (minimal xfce + KasmVNC + chromium$([ "$APP" = code ] && echo ' + code-server'); heavy)…" "$Y"
+  [ -n "$DESKTOP" ] && { msg "  DESKTOP=$DESKTOP → installing the desktop stack ($([ "$de" = kde ] && echo 'full KDE Plasma — ~2 GB, the slow one' || echo 'minimal xfce') + KasmVNC + chromium$([ "$APP" = code ] && echo ' + code-server'); heavy)…" "$Y"
     guiinstallscript "$rootfs/root/.gui-install.sh"; }
   { printf '#!/bin/bash\nset -e\nexport DEBIAN_FRONTEND=noninteractive\ndpkg --configure -a 2>/dev/null || true\napt-get update\napt-get install -y curl ca-certificates\n'
     printf 'install-node(){ command -v node >/dev/null 2>&1 && return 0; curl -fsSL "https://deb.nodesource.com/setup_${1:-22}.x" | bash - ; apt-get install -y nodejs; }\n'
     [ -n "$INSTALL" ] && printf '%s\n' "$INSTALL"
     [ "$MITM" = 1 ] && printf 'apt-get install -y mitmproxy%s || { apt-get install -y python3-pip python3-venv libnss3-tools && pip3 install --break-system-packages mitmproxy; }\n' "$([ -n "$DESKTOP" ] && printf ' libnss3-tools')"
-    [ -n "$DESKTOP" ] && printf 'bash /root/.gui-install.sh %s %s\n' "${AGENTBOX_KASMVNC_VER:-1.4.0}" "$APP"
+    [ -n "$DESKTOP" ] && printf 'bash /root/.gui-install.sh %s %s %s\n' "${AGENTBOX_KASMVNC_VER:-1.4.0}" "$APP" "$de"
   } > "$rootfs/root/.abbuild.sh"
   mkdir -p "$rootfs/root/.claude"
   [ -f "$rootfs/root/.claude/.claude.json" ] || printf '{"hasCompletedOnboarding": true}\n' > "$rootfs/root/.claude/.claude.json"
@@ -349,12 +356,14 @@ boxrfb(){ local rootfs="$1" alias="$2"
 # through mitmweb (CA trusted into the box's nssdb, proxy flag added). GPU=virgl renders GL on the phone's GPU through
 # the Termux-side vtest server (see virglsock), degrading to CPU if anything about that is unavailable. RFB=1 mirrors
 # the same display onto a plain-VNC port for native viewers (see boxrfb), degrading to web-only if x11vnc won't run.
-aboxgui(){ local prof="$1" alias="$2" rootfs="$3" app="${4:-code}" mnt="${5:-cwd}" mitm="${6:-0}" lan="${7:-0}" gpu="${8:-}" rfb="${9:-0}" \
-    pw tgt geo iface=127.0.0.1 lip= sock= gbind= gpuenv= rfbbind=-localhost i=
+aboxgui(){ local prof="$1" alias="$2" rootfs="$3" app="${4:-code}" mnt="${5:-cwd}" mitm="${6:-0}" lan="${7:-0}" gpu="${8:-}" rfb="${9:-0}" de \
+    pw tgt geo iface=127.0.0.1 lip= sock= gbind= gpuenv= rfbbind=-localhost i= sess=
+  de=$(dename "${10:-xfce}"); sess=$(desession "$de")          # which session this box was built with (xfce | kde)
   [ "$lan" = 1 ] && iface=0.0.0.0                              # LAN=1 → bind KasmVNC/code-server to all interfaces (mitmweb stays local)
   needtmux || return 1
-  { [ -x "$rootfs/usr/bin/startxfce4" ] && [ -d "$rootfs/usr/share/kasmvnc" ]; } \
-    || { msg "the desktop stack isn't in box '$prof' yet — rebuild it: ab remove $prof && ab $prof" "$Y"; return 1; }
+  # The session binary is the test, so switching DESKTOP= in the profile is caught here rather than as a black screen.
+  { [ -x "$rootfs$sess" ] && [ -d "$rootfs/usr/share/kasmvnc" ]; } \
+    || { msg "box '$prof' has no $de desktop stack ($sess missing — a different DESKTOP=, or never built) — rebuild it: ab remove $prof && ab $prof" "$Y"; return 1; }
   tmux has-session -t "=ab-boxgui" 2>/dev/null \
     && { msg "a box desktop is already running (one at a time) — close it first: ab stop" "$Y"; return 1; }
   # GPU=virgl: start/locate the Termux-side vtest server and make sure the box has mesa's virgl client. EVERY failure
@@ -370,7 +379,17 @@ aboxgui(){ local prof="$1" alias="$2" rootfs="$3" app="${4:-code}" mnt="${5:-cwd
   # blacklist_threshold=100: every client arrives as 127.0.0.1 and each page-load counts as a failed attempt — the
   # default threshold of 5 would blacklist the owner within a few loads.
   printf 'network:\n  interface: %s\n  websocket_port: %s\n  ssl:\n    require_ssl: false\nsecurity:\n  brute_force_protection:\n    blacklist_threshold: 100\n    blacklist_timeout: 10\n' "$iface" "$GUI_BOXWEB" > "$rootfs/root/.vnc/kasmvnc.yaml"
-  printf '#!/bin/sh\nxset s off -dpms s noblank 2>/dev/null\nxsetroot -solid "#000000" 2>/dev/null\nexec xfce4-session\n' > "$rootfs/root/.vnc/xstartup"
+  # xstartup: what KasmVNC's vncserver execs once X is up. xfce4-session brings up its own bus; Plasma does NOT, so it
+  # gets a session bus wrapped around it. With no GPU socket, Plasma is told to skip compositing and put QML on
+  # QPainter — on llvmpipe that is the difference between a desktop and a slideshow. (KWIN_COMPOSE=N is the X11
+  # 'no compositing' value; Q/QPainter is Wayland-only and would be silently ignored here.)
+  { printf '#!/bin/sh\nxset s off -dpms s noblank 2>/dev/null\nxsetroot -solid "#000000" 2>/dev/null\n'
+    if [ "$de" = kde ]; then
+      printf 'export XDG_SESSION_TYPE=x11 XDG_CURRENT_DESKTOP=KDE DESKTOP_SESSION=plasma\n'
+      [ -z "$sock" ] && printf 'export KWIN_COMPOSE=N QT_QUICK_BACKEND=software\n'
+      printf 'command -v dbus-run-session >/dev/null 2>&1 && exec dbus-run-session -- %s\nexec dbus-launch --exit-with-session %s\n' "$sess" "$sess"
+    else printf 'exec xfce4-session\n'; fi
+  } > "$rootfs/root/.vnc/xstartup"
   chmod +x "$rootfs/root/.vnc/xstartup"; : > "$rootfs/root/.vnc/.de-was-selected"
   # config.yaml (0600) is the ONLY secret file: it holds the shared password. The run script reads it from there so no
   # secret rides on argv. Geometry is expanded HOST-side (AGENTBOX_* is stripped from the box env).
@@ -452,6 +471,9 @@ EOS
   [ "$mnt" = none ] && msg "box desktop '$prof' started — SEALED (no folder bound):" "$G" \
     || msg "box desktop '$prof' started — scoped to $(short "$PWD") (opens as $tgt):" "$G"
   kv "  desktop (KasmVNC)" "http://localhost:$GUI_BOXWEB  (login user: agent)" "$G"
+  # Plasma is a lot fussier than xfce under proot, so say where its log is BEFORE it's needed — a session that dies
+  # after Xvnc came up shows as a black desktop, not as a failed launch (the tmux session is still there either way).
+  [ "$de" = kde ] && kv "  session" "KDE Plasma$([ -z "$sock" ] && printf -- ' — compositing off, QML on QPainter (no GPU; GPU=virgl turns the effects back on)')  ·  black screen? see /root/.vnc/*:1.log in the box" "$G"
   [ "$lan" = 1 ] && { lip=$(lanips | awk '{print $1}'); [ -n "$lip" ] && kv "  on your LAN" "http://$lip:$GUI_BOXWEB  (anyone on this Wi-Fi, same password)" "$Y"; }
   if [ "$rfb" = 1 ]; then
     if [ -e "$rootfs/root/.rfb.ok" ]; then
@@ -527,8 +549,10 @@ abox(){ local prof="$1"; shift; local cmd="$*" cf alias rootfs \
   case "${RFB:-0}" in ''|0) RFB=0;; 1) :;;                       # RFB= is desktop-only and is a plain on/off
     *) msg "profile '$prof': RFB must be 0 or 1 (got '$RFB') — ignoring" "$Y"; RFB=0;; esac
   [ "$RFB" = 1 ] && [ -z "$DESKTOP" ] && { msg "note: RFB=1 applies to a DESKTOP box only — ignored here" "$Y"; RFB=0; }
+  case "${DESKTOP:-}" in ''|xfce|kde|plasma|KDE|Plasma) :;;      # DESKTOP= names the session, and only these two exist
+    *) msg "profile '$prof': DESKTOP='$DESKTOP' isn't a session ab knows (xfce|kde) — building/running it as xfce" "$Y";; esac
   # DESKTOP set → run a scoped desktop (background); nothing after this runs for a GUI box.
-  [ -n "$DESKTOP" ] && { aboxgui "$prof" "$alias" "$rootfs" "$APP" "$MOUNT" "$MITM" "$LAN" "$GPU" "$RFB"; return $?; }
+  [ -n "$DESKTOP" ] && { aboxgui "$prof" "$alias" "$rootfs" "$APP" "$MOUNT" "$MITM" "$LAN" "$GPU" "$RFB" "$DESKTOP"; return $?; }
   run="${cmd:-$RUN}"; [ "$MITM" = 1 ] && ms='; mitm on'
   ef="$rootfs/root/.abenv.$$"; efn=".abenv.$$"     # token file lives inside the isolated rootfs; nothing else is bound
   ( umask 077; aboxenv "$TOKENS" > "$ef" )
@@ -641,20 +665,29 @@ snapshot(){ local prof="${1:-}" verb="${2:-status}" rootfs snapfile par base a
 
 # ── Desktop install script (shared by aboxbuild for DESKTOP=xfce boxes) ──
 gui_randpw(){ head -c 24 /dev/urandom | base64 2>/dev/null | tr -dc 'a-zA-Z0-9' | cut -c1-16; }   # bounded, can't hang
-# Emit the desktop-stack install script (xfce + chromium + KasmVNC + code-server) to $1. In-box args: KVER APP.
+# Emit the desktop-stack install script (session + chromium + KasmVNC + code-server) to $1. In-box args: KVER APP DE.
 guiinstallscript(){ cat > "$1" <<'EOS'
 #!/bin/bash
 set -e
 export DEBIAN_FRONTEND=noninteractive
 KVER="${1:-1.4.0}"   # passed host-side (AGENTBOX_* is filtered out of the box env, so it can't be read here)
 APP="${2:-code}"     # code = install code-server (VS Code) | browser = chromium only, skip code-server
+DE="${3:-xfce}"      # xfce = minimal session + wm | kde = a full Plasma desktop (already normalised host-side)
 apt-get update
 # drop the old TigerVNC/noVNC stack if a previous install left it (KasmVNC replaces it)
 apt-get purge -y tigervnc-standalone-server tigervnc-common novnc websockify >/dev/null 2>&1 || true
-# minimal xfce: session + window manager only — no panel/desktop/thunar/goodies (black root set in xstartup)
 apt-get install -y --no-install-recommends \
-  xfce4-session xfwm4 dbus-x11 x11-xserver-utils fonts-dejavu-core fonts-noto-cjk fonts-noto-color-emoji \
-  curl ca-certificates
+  dbus-x11 x11-xserver-utils fonts-dejavu-core fonts-noto-cjk fonts-noto-color-emoji curl ca-certificates
+if [ "$DE" = kde ]; then
+  # Plasma is installed WITH recommends, the opposite of the xfce line below, and deliberately: a
+  # --no-install-recommends Plasma tends to come up half-dressed (missing icon themes, QML bits, integration) and a
+  # desktop that won't start is a far worse trade than a bigger download. plasma-workspace carries startplasma-x11,
+  # the session entry point the launcher execs; kwin-x11 is the X11 window manager (kwin-wayland is useless here).
+  apt-get install -y plasma-desktop plasma-workspace kwin-x11 systemsettings konsole breeze breeze-icon-theme
+else
+  # minimal xfce: session + window manager only — no panel/desktop/thunar/goodies (black root set in xstartup)
+  apt-get install -y --no-install-recommends xfce4-session xfwm4
+fi
 # chromium: package name differs by distro (debian: chromium, ubuntu: chromium-browser)
 apt-get install -y chromium 2>/dev/null || apt-get install -y chromium-browser || true
 # chromium under proot has no sandbox namespaces and a tiny /dev/shm → bake safe flags for every launch
@@ -671,13 +704,14 @@ if [ ! -d /usr/share/kasmvnc ]; then
 fi
 # code-server (browser VS Code) — only for APP=code. The password is set later by aboxgui, not here.
 if [ "$APP" = code ]; then command -v code-server >/dev/null 2>&1 || curl -fsSL https://code-server.dev/install.sh | sh; fi
+[ "$DE" = kde ] && SESSBIN=/usr/bin/startplasma-x11 || SESSBIN=/usr/bin/startxfce4
 echo "----------------------------------------"
-echo "desktop  : xfce $([ -x /usr/bin/startxfce4 ] && echo ok || echo MISSING)"
+echo "desktop  : $DE $([ -x "$SESSBIN" ] && echo "ok ($SESSBIN)" || echo MISSING)"
 echo "kasmvnc  : $([ -d /usr/share/kasmvnc ] && echo "ok (v$KVER, $CN/$ARCH)" || echo MISSING)"
 echo "chromium : $(command -v chromium chromium-browser 2>/dev/null | head -1 || echo MISSING)"
 echo "code-srv : $([ "$APP" = code ] && { code-server --version 2>/dev/null | head -1 || echo unknown; } || echo 'skipped (browser-only)')"
 [ -d /usr/share/kasmvnc ] || { echo "ERROR: KasmVNC did not install" >&2; exit 1; }
-[ -x /usr/bin/startxfce4 ] || { echo "ERROR: xfce did not install" >&2; exit 1; }
+[ -x "$SESSBIN" ] || { echo "ERROR: the $DE session did not install ($SESSBIN missing)" >&2; exit 1; }
 EOS
 }
 
@@ -1093,6 +1127,7 @@ usage(){
   hd "▍Notes"
   nt profile  "$(short "$VC")/profile/<name>.conf — AGENT·PKGS·TOKENS·RUN·MOUNT·EPHEMERAL·DESKTOP·APP·MITM·LAN·RFB·GPU·DIST  (docker: set INSTALL='…')"
   nt new      "a name with no profile yet asks before creating the box — Enter = yes, n = cancel (AB_YES=1 skips the ask)"
+  nt desktop  "DESKTOP=xfce (minimal session + wm) or kde (full KDE Plasma — fancy, ~2 GB build); both serve the same KasmVNC desktop on $GUI_BOXWEB"
   nt gpu      "GPU=virgl (desktop boxes) renders GL on the phone's GPU via a Termux-side server — opt-in, CPU if unavailable"
   nt rfb      "RFB=1 (desktop boxes) also serves the SAME desktop as plain VNC on $GUI_BOXRFB — for a native viewer with a trackpad mode (AVNC · bVNC); the browser client is touch-absolute"
   nt tokens   "$(short "$ENVF")  (0600; only a profile's TOKENS keys are injected; AGENTBOX_* excluded)"
