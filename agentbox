@@ -1,6 +1,6 @@
 #!/data/data/com.termux/files/usr/bin/bash
 # Version — single source of truth; the installer greps ^VERSION= (keep the line bare, no trailing comment).
-VERSION=3.16.0
+VERSION=3.17.0
 # agentbox — throwaway, folder-scoped AI-agent boxes for a phone (Android Termux + proot-distro ONLY).
 #
 # THREAT MODEL: this protects YOUR FILES from *accidents* (an agent touching the wrong folder), not from a hostile
@@ -224,6 +224,26 @@ aboxbuild(){ local prof="$1" force="${2:-}" cf alias rootfs DIST="$DIST" \
   [ -f "$rootfs/root/.claude/.claude.json" ] || printf '{"hasCompletedOnboarding": true}\n' > "$rootfs/root/.claude/.claude.json"
   if proot-distro login "$alias" -- bash /root/.abbuild.sh; then rm -f "$rootfs/root/.abbuild.sh" "$rootfs/root/.gui-install.sh"; msg "box '$prof' ready" "$G"
   else rm -f "$rootfs/root/.abbuild.sh" "$rootfs/root/.gui-install.sh"; msg "build failed for '$prof' (see output above)" "$R"; return 1; fi; }
+# `ab upgrade <name>` — refresh a BUILT box's packages IN PLACE: apt update/upgrade, then re-run its (idempotent) agent/PKGS
+# recipe so the CLI agent + apt packages move to latest, WITHOUT deleting the rootfs (no re-download). Sits between
+# `ab update` (updates agentbox itself, never box contents) and `ab rebuild` (wipes + reinstalls). Docker-mode boxes
+# (INSTALL set in the conf) re-run those steps verbatim; the desktop stack is untouched — rebuild for that.
+boxupgrade(){ local prof="${1:-}" alias rootfs cf INSTALL= TOKENS= RUN= MOUNT=cwd EPHEMERAL=0 DESKTOP= APP=code MITM=0 AGENT=none PKGS= DIST=
+  [ -n "$prof" ] || { msg "which box? ab upgrade <name>" "$Y"; return 1; }
+  alias=$(aboxalias "$prof"); rootfs=$(pdroot "$alias")
+  [ -n "$rootfs" ] || { msg "box '$prof' isn't built yet — nothing to upgrade; run it first: ab run $prof" "$Y"; return 1; }
+  cf=$(aboxconf "$prof"); [ -f "$cf" ] && . "$cf"
+  [ -n "$INSTALL" ] || INSTALL=$(agent_recipe "$AGENT" "$PKGS") \
+    || { msg "profile '$prof': unknown AGENT '$AGENT' (use claude|codex|copilot|none)" "$R"; return 1; }
+  aboxguard "$prof"                                             # if THIS box's desktop is live, stop it first (apt-upgrading a running desktop is asking for trouble)
+  msg "upgrading box '$prof' in place — apt update/upgrade + agent/PKGS refresh (no rebuild, no re-download)…" "$G"
+  { printf '#!/bin/bash\nset -e\nexport DEBIAN_FRONTEND=noninteractive\ndpkg --configure -a 2>/dev/null || true\napt-get update\napt-get -y upgrade\n'
+    printf 'install-node(){ command -v node >/dev/null 2>&1 && return 0; curl -fsSL "https://deb.nodesource.com/setup_${1:-22}.x" | bash - ; apt-get install -y nodejs; }\n'
+    [ -n "$INSTALL" ] && printf '%s\n' "$INSTALL"
+    printf 'apt-get -y autoremove || true; apt-get clean || true\n'
+  } > "$rootfs/root/.abupgrade.sh"
+  if proot-distro login "$alias" -- bash /root/.abupgrade.sh; then rm -f "$rootfs/root/.abupgrade.sh"; msg "box '$prof' upgraded (packages current; rebuild only for AGENT/DESKTOP changes: ab rebuild $prof)" "$G"
+  else rm -f "$rootfs/root/.abupgrade.sh"; msg "upgrade failed for '$prof' (see output above)" "$R"; return 1; fi; }
 # Stop the running box desktop (session ab-boxgui); a throwaway (EPHEMERAL=1) desktop box is deleted on stop so
 # its next launch is genuinely fresh (this is where EPHEMERAL is honoured for desktop boxes).
 aboxguistop(){ local prof rootfs; prof=$(cat "$STATE/boxgui.prof" 2>/dev/null)
@@ -357,6 +377,8 @@ abox(){ local prof="$1"; shift; local cmd="$*" cf alias rootfs \
     [ -n "$cv" ] && [ -n "$tv" ] && [ "$cv" != "$tv" ] \
       && msg "note: $(short "$cf") is from the $prof template v$cv; the current template is v$tv — it changed since, worth a look" "$Y"
   else mkdir -p "$(dirname "$cf")"; aboxdefault "$cf" "$prof" || return 1
+    case " run save restore remove rm rebuild upgrade stop pw pkg setup update sync session help version ls list " in
+      *" $prof "*) msg "note: '$prof' is also an ab command — run this box with 'ab run $prof' ('ab $prof' triggers the command instead)" "$Y";; esac
     msg "new profile $(short "$cf") — binds only the launch folder, injects only its tokens (edit it directly)" "$Y"; fi
   . "$cf"; mkenv
   # Auto-session: an interactive, command-less CLI box opens a fresh tmux session each launch (survives ssh-drop;
@@ -896,13 +918,14 @@ usage(){
   fi
   [ "$withstatus" = full ] && { printf '\n'; boxls; }            # bare `ab` shows current boxes/templates/snapshots here
   hd "▍Boxes"
-  row "<name>" "[cmd]"    "run a box scoped to this folder — builds if missing, runs cmd (else RUN)"
-  row "" ""               "  no cmd → a fresh tmux session each launch (survives ssh-drop)"
-  row "" ""               "  reattach an earlier one with 'ab session'; unknown name → a default claude box"
+  row run     "<name> [cmd]" "build+run a box scoped to this folder — runs cmd (else RUN); builds if missing"
+  row "<name>" "[cmd]"    "  shorthand for 'ab run <name>' (any name that isn't a reserved command below)"
+  row "" ""               "  no cmd → a fresh tmux session each launch (survives ssh-drop; reattach: ab session)"
   row save    "<name>"    "golden snapshot of that box's rootfs"
   row restore "<name>"    "restore that box from its snapshot"
-  row remove  "<name>"    "delete the box rootfs + snapshot (also asks about the profile conf)"
-  row rebuild "<name>"    "force-rebuild the box from its profile (keeps the snapshot)"
+  row remove  "<name>"    "delete the box rootfs + snapshot (alias: rm; also asks about the profile conf)"
+  row rebuild "<name>"    "force-rebuild the box from its profile — wipes + reinstalls (keeps the snapshot)"
+  row upgrade "<name>"    "update a built box's apt + agent packages IN PLACE — no rebuild, no re-download"
   row stop    ""          "close the running box desktop — keeps the box (ab remove = delete + rebuild)"
   row "pw <name>" "[password]" "set/show a desktop box's login password (else it's random each launch)"
   row "pkg <name>" "[add|rm|search]" "edit a simple profile's PKGS or search its apt catalog (rebuild to apply)"
@@ -917,7 +940,7 @@ usage(){
   row "sync remove" "[path]" "delete a pair's sync state"
   hd "▍Tool"
   row setup   ""          "guided bootstrap — links · font · keys · tmux · unkill · proot · tokens"
-  row update  ""          "pull the latest version (code + templates only)"
+  row update  ""          "update agentbox itself — code + templates (NOT box packages; see 'ab upgrade')"
   row help    ""          "show this help screen"
   row version ""          "print the agentbox version"
   hd "▍Templates" "ab <name> creates a box from one; your edits then live in $(short "$VC")"
@@ -927,7 +950,8 @@ usage(){
   hd "▍Notes"
   nt profile  "$(short "$VC")/profile/<name>.conf — AGENT·PKGS·TOKENS·RUN·MOUNT·EPHEMERAL·DESKTOP·APP·MITM·LAN·DIST  (docker: set INSTALL='…')"
   nt tokens   "$(short "$ENVF")  (0600; only a profile's TOKENS keys are injected; AGENTBOX_* excluded)"
-  nt reserved "save restore remove rebuild stop pw pkg setup update sync session help version ls list"
+  nt reserved "run save restore remove rm rebuild upgrade stop pw pkg setup update sync session help version ls list"
+  nt shadow   "a box whose name is a reserved word runs only via 'ab run <name>' — the 'ab <name>' shorthand is taken"
   nt network  "shares the phone network — for a different exit IP use a whole-device Android VPN app"
   return 0
 }
@@ -937,10 +961,12 @@ migrateconf   # move any pre-3.13 $VC/box-<name>.conf profiles into $VC/profile/
 case "${1:-}" in
   "") usage full;;                                # bare ab → banner + current boxes + help
   ls|list) boxls;;
+  run)     shift; if [ -n "${1:-}" ]; then abox "$@"; else msg "which box? ab run <name>  (shorthand: ab <name>)" "$Y"; fi;;
   save)    shift; boxsave "$@";;
   restore) shift; boxrestore "$@";;
-  remove)  shift; boxremove "$@";;
+  remove|rm) shift; boxremove "$@";;
   rebuild) shift; if [ -n "${1:-}" ]; then aboxbuild "$1" force; else msg "which box? ab rebuild <name>" "$Y"; fi;;
+  upgrade) shift; boxupgrade "$@";;
   stop)    boxstop;;                              # close the running box desktop (keeps the box; ab remove = delete + rebuild)
   pw)      shift; abpw "$@";;                      # set/show a desktop box's login password
   pkg)     shift; abpkg "$@";;
