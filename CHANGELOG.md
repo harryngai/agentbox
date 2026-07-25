@@ -9,6 +9,9 @@ Versioning is `major.normal.minor`:
 
 `ab update` always pulls the latest from `main`, so `ab version` is the source of truth for what's deployed. Each box template also carries its own `# template-version:` stamp, bumped whenever that template's file changes; `ab` warns when your `~/.config/agentbox/box-<name>.conf` copy is behind the shipped template.
 
+## 3.21.1
+- **`desktop` template (v3.21.1): `RFB=1` is now on by default** instead of shipped commented out. The browser client is touch-absolute — the pointer lands under your finger — and a Plasma desktop is exactly the case where you want to *aim* a pointer, so the native-VNC door (127.0.0.1:5901, localhost, same password) is open from the first launch. Set `RFB=0` in your copy to close it. Unchanged elsewhere: `web` keeps it commented out, since a browsing box has no reason to carry an extra listener.
+
 ## 3.21.0
 - **`DESKTOP=` now names a session, and `kde` is the new one: a full KDE Plasma desktop.** The value was previously a label nobody read — anything non-empty got the same minimal xfce. Now `DESKTOP=xfce` (unchanged: `xfce4-session` + `xfwm4`, no panel/thunar/goodies) or `DESKTOP=kde` (`plasma-desktop` + `plasma-workspace` + `kwin-x11` + `systemsettings` + `konsole` + `breeze`). Anything else still maps to xfce, so existing profiles build exactly as before.
   - **Plasma is installed *with* recommends** — deliberately the opposite of the xfce line beside it. A `--no-install-recommends` Plasma tends to come up half-dressed (missing icon themes, QML bits, integration), and a desktop that won't start is a far worse trade than a bigger download. Expect **~2 GB** on the first build; the launcher says so before it starts.
