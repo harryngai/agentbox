@@ -1,6 +1,6 @@
 #!/data/data/com.termux/files/usr/bin/bash
 # Version — single source of truth; the installer greps ^VERSION= (keep the line bare, no trailing comment).
-VERSION=3.17.0
+VERSION=3.18.0
 # agentbox — throwaway, folder-scoped AI-agent boxes for a phone (Android Termux + proot-distro ONLY).
 #
 # THREAT MODEL: this protects YOUR FILES from *accidents* (an agent touching the wrong folder), not from a hostile
@@ -146,6 +146,7 @@ tpldesc(){ ( . "$1" 2>/dev/null; local d
   elif [ -z "$RUN" ]; then d="$AGENT installed, opens a shell"
   else d="runs $RUN"; fi
   [ "${MITM:-0}" = 1 ] && d="$d · MITM"
+  [ -n "${GPU:-}" ] && d="$d · $GPU GPU"
   [ "${EPHEMERAL:-0}" = 1 ] && d="$d · throwaway"
   [ "${MOUNT:-cwd}" = none ] && d="$d · sealed"
   printf '%s' "$d" ) }
@@ -201,7 +202,7 @@ GH
 # Build the box for profile <name> from its conf: base (apt update + curl + ca-certificates + install-node helper),
 # then INSTALL (docker mode) or the AGENT/PKGS recipe (simple mode), then mitmproxy (MITM=1), then the desktop (DESKTOP).
 aboxbuild(){ local prof="$1" force="${2:-}" cf alias rootfs DIST="$DIST" \
-    INSTALL= TOKENS= RUN= MOUNT=cwd EPHEMERAL=0 DESKTOP= APP=code MITM=0 AGENT=none PKGS=
+    INSTALL= TOKENS= RUN= MOUNT=cwd EPHEMERAL=0 DESKTOP= APP=code MITM=0 LAN=0 GPU= AGENT=none PKGS=
   cf=$(aboxconf "$prof"); alias=$(aboxalias "$prof"); [ -f "$cf" ] && . "$cf"; DIST="${DIST:-debian}"
   [ -n "$INSTALL" ] || INSTALL=$(agent_recipe "$AGENT" "$PKGS") \
     || { msg "profile '$prof': unknown AGENT '$AGENT' (use claude|codex|copilot|none)" "$R"; return 1; }
@@ -228,7 +229,7 @@ aboxbuild(){ local prof="$1" force="${2:-}" cf alias rootfs DIST="$DIST" \
 # recipe so the CLI agent + apt packages move to latest, WITHOUT deleting the rootfs (no re-download). Sits between
 # `ab update` (updates agentbox itself, never box contents) and `ab rebuild` (wipes + reinstalls). Docker-mode boxes
 # (INSTALL set in the conf) re-run those steps verbatim; the desktop stack is untouched — rebuild for that.
-boxupgrade(){ local prof="${1:-}" alias rootfs cf INSTALL= TOKENS= RUN= MOUNT=cwd EPHEMERAL=0 DESKTOP= APP=code MITM=0 AGENT=none PKGS= DIST=
+boxupgrade(){ local prof="${1:-}" alias rootfs cf INSTALL= TOKENS= RUN= MOUNT=cwd EPHEMERAL=0 DESKTOP= APP=code MITM=0 LAN=0 GPU= AGENT=none PKGS= DIST=
   [ -n "$prof" ] || { msg "which box? ab upgrade <name>" "$Y"; return 1; }
   alias=$(aboxalias "$prof"); rootfs=$(pdroot "$alias")
   [ -n "$rootfs" ] || { msg "box '$prof' isn't built yet — nothing to upgrade; run it first: ab run $prof" "$Y"; return 1; }
@@ -250,7 +251,7 @@ aboxguistop(){ local prof rootfs; prof=$(cat "$STATE/boxgui.prof" 2>/dev/null)
   [ -n "$prof" ] && rootfs=$(pdroot "$(aboxalias "$prof")")
   tmux kill-session -t "=ab-boxgui" 2>/dev/null; boxkillprocs "$rootfs"   # Xvnc/chromium/mitmweb daemons don't die with the session
   rm -f "$STATE/boxgui.prof"
-  if [ -n "$prof" ]; then local cf INSTALL TOKENS RUN MOUNT EPHEMERAL=0 DESKTOP APP MITM AGENT PKGS DIST
+  if [ -n "$prof" ]; then local cf INSTALL TOKENS RUN MOUNT EPHEMERAL=0 DESKTOP APP MITM LAN GPU AGENT PKGS DIST
     cf=$(aboxconf "$prof"); [ -f "$cf" ] && . "$cf"
     [ "$EPHEMERAL" = 1 ] && aboxdrop "$(aboxalias "$prof")" && msg "throwaway box '$prof' deleted — next launch is fresh" "$Y"; fi
   anysession || { [ "$(wakestat)" = on ] && wakeoff; }; return 0; }
@@ -272,17 +273,53 @@ abpw(){ local prof="${1:-}" pw="${2:-}" f
 aboxguard(){ [ -f "$STATE/boxgui.prof" ] && [ "$(cat "$STATE/boxgui.prof" 2>/dev/null)" = "$1" ] \
     && tmux has-session -t "=ab-boxgui" 2>/dev/null \
     && { msg "stopping box '$1's running desktop first…" "$Y"; aboxguistop; }; return 0; }
+# ── GPU=virgl (desktop boxes) ──────────────────────────────────────
+# WHY a proxy and not a driver in the box: Debian/Ubuntu build Mesa's Adreno Vulkan driver (turnip) for the MSM DRM
+# kernel interface, but Android exposes the GPU as /dev/kgsl-3d0 and hides /dev/dri, so an in-box turnip enumerates
+# nothing. Instead a virgl *vtest* server runs on the TERMUX side, where Android's own GL driver is available (works on
+# GPUs turnip can't drive yet, e.g. Adreno 830), and the box reaches it over ONE unix socket with GALLIUM_DRIVER=virpipe.
+# Rendering lands on the GPU; frames still present through X shm, so KasmVNC is unchanged.
+# NOTE this is a widening of the box boundary: vtest is not a hardened protocol. Opt-in per profile, hence GPU=.
+# Echoes the socket path on success (warnings go to stderr so they never pollute the captured path).
+virglsock(){ local c i s= log="${TMPDIR:-$PREFIX/tmp}/virgl-server.log"
+  has virgl_test_server_android || { msg "  GPU=virgl → installing the Termux GPU server (x11-repo + virglrenderer-android)…" "$Y" >&2
+    pkg install -y x11-repo >/dev/null 2>&1; pkg install -y virglrenderer-android >/dev/null 2>&1; }
+  has virgl_test_server_android \
+    || { msg "  GPU=virgl: virglrenderer-android didn't install — desktop continues on CPU (llvmpipe)" "$Y" >&2; return 1; }
+  pgrep -f virgl_test_server_android >/dev/null 2>&1 || nohup virgl_test_server_android >"$log" 2>&1 &
+  # Termux puts the socket in $TMPDIR; mesa's built-in default is /tmp/.virgl_test — probe, never assume.
+  for i in $(seq 1 10); do
+    for c in "${TMPDIR:-$PREFIX/tmp}/.virgl_test" "$PREFIX/tmp/.virgl_test" /tmp/.virgl_test; do
+      [ -S "$c" ] && { s="$c"; break; }; done
+    [ -n "$s" ] && break; sleep 1; done
+  [ -n "$s" ] || { msg "  GPU=virgl: no vtest socket appeared (server log: $log) — desktop continues on CPU" "$Y" >&2; return 1; }
+  printf '%s' "$s"; }
+# The box side needs mesa's virgl/vtest client, which stock libgl1-mesa-dri already carries (no custom Mesa build).
+# Done at LAUNCH, not build: one code path that also fixes desktop boxes built before GPU= existed. Idempotent — the
+# host-side glob check costs nothing once installed.
+boxgl(){ local rootfs="$1" alias="$2" f
+  for f in "$rootfs"/usr/lib/*/libgallium*.so*; do [ -e "$f" ] && return 0; done
+  msg "  GPU=virgl → adding mesa's virgl client to the box (one-off apt: libgl1-mesa-dri mesa-utils)…" "$Y"
+  proot-distro login "$alias" --isolated -- bash -c 'export DEBIAN_FRONTEND=noninteractive
+    apt-get update -qq && apt-get install -y --no-install-recommends libgl1-mesa-dri mesa-utils' >/dev/null 2>&1 \
+    || { msg "  GPU=virgl: mesa install failed (network?) — desktop continues on CPU" "$Y"; return 1; }
+  return 0; }
 # Scoped desktop for a DESKTOP=xfce box: KasmVNC + (code-server for APP=code, or chromium for APP=browser) inside the
 # box. Own ports (6902/8081, localhost); one box desktop at a time (session ab-boxgui). Fresh random password each
 # start, printed. MOUNT=none binds nothing (SEALED); otherwise the cwd opens as /work-<cwd>. MITM=1 routes chromium
-# through mitmweb (CA trusted into the box's nssdb, proxy flag added).
-aboxgui(){ local prof="$1" alias="$2" rootfs="$3" app="${4:-code}" mnt="${5:-cwd}" mitm="${6:-0}" lan="${7:-0}" pw tgt geo iface=127.0.0.1 lip=
+# through mitmweb (CA trusted into the box's nssdb, proxy flag added). GPU=virgl renders GL on the phone's GPU through
+# the Termux-side vtest server (see virglsock), degrading to CPU if anything about that is unavailable.
+aboxgui(){ local prof="$1" alias="$2" rootfs="$3" app="${4:-code}" mnt="${5:-cwd}" mitm="${6:-0}" lan="${7:-0}" gpu="${8:-}" \
+    pw tgt geo iface=127.0.0.1 lip= sock= gbind= gpuenv=
   [ "$lan" = 1 ] && iface=0.0.0.0                              # LAN=1 → bind KasmVNC/code-server to all interfaces (mitmweb stays local)
   needtmux || return 1
   { [ -x "$rootfs/usr/bin/startxfce4" ] && [ -d "$rootfs/usr/share/kasmvnc" ]; } \
     || { msg "the desktop stack isn't in box '$prof' yet — rebuild it: ab remove $prof && ab $prof" "$Y"; return 1; }
   tmux has-session -t "=ab-boxgui" 2>/dev/null \
     && { msg "a box desktop is already running (one at a time) — close it first: ab stop" "$Y"; return 1; }
+  # GPU=virgl: start/locate the Termux-side vtest server and make sure the box has mesa's virgl client. EVERY failure
+  # degrades to CPU rendering with a warning — a GPU problem must never cost you the desktop.
+  if [ "$gpu" = virgl ]; then sock=$(virglsock) || sock=; [ -n "$sock" ] && { boxgl "$rootfs" "$alias" || sock=; }; fi
   pw=$(cat "$VC/gui-$prof.pw" 2>/dev/null); [ -n "$pw" ] || pw=$(gui_randpw)   # a fixed password (ab pw <name>) wins, else random
   mkdir -p "$rootfs/root/.vnc" "$rootfs/root/.config/code-server"
   # blacklist_threshold=100: every client arrives as 127.0.0.1 and each page-load counts as a failed attempt — the
@@ -294,12 +331,21 @@ aboxgui(){ local prof="$1" alias="$2" rootfs="$3" app="${4:-code}" mnt="${5:-cwd
   # secret rides on argv. Geometry is expanded HOST-side (AGENTBOX_* is stripped from the box env).
   ( umask 077; { echo "bind-addr: $iface:$GUI_BOXCODE"; echo "auth: password"; echo "password: $pw"; echo "cert: false"; } > "$rootfs/root/.config/code-server/config.yaml" )
   geo="${AGENTBOX_GUI_GEOMETRY:-1440x900}"; tgt=$(wtarget); [ "$mnt" = none ] && tgt=/root
+  # With the socket in place, every X client in the session renders through it (xfwm, chromium, GL apps). Empty when
+  # off — which just leaves a blank line in the generated script.
+  [ -n "$sock" ] && gpuenv='export GALLIUM_DRIVER=virpipe MESA_GL_VERSION_OVERRIDE=4.0 VTEST_SOCKET_NAME=/tmp/.virgl_test'
+  # chromium's flags are baked into /etc/chromium.d/agentbox at BUILD time; rewrite them each launch so toggling GPU=
+  # takes effect without a rebuild. --ignore-gpu-blocklist is needed because chromium blocklists the virgl renderer.
+  [ -d "$rootfs/etc" ] && { mkdir -p "$rootfs/etc/chromium.d"
+    printf 'export CHROMIUM_FLAGS="$CHROMIUM_FLAGS --no-sandbox --disable-dev-shm-usage %s"\n' \
+      "$([ -n "$sock" ] && printf -- '--ignore-gpu-blocklist' || printf -- '--disable-gpu')" > "$rootfs/etc/chromium.d/agentbox"; }
   { cat <<EOS
 #!/bin/bash
 export HOME=/root
 PW=\$(sed -n 's/^password: //p' /root/.config/code-server/config.yaml 2>/dev/null | head -1)
 [ -n "\$PW" ] && printf '%s\n%s\n' "\$PW" "\$PW" | timeout 15 vncpasswd -u agent -w -o >/dev/null 2>&1 || true
 export XDG_RUNTIME_DIR="/tmp/runtime-\$(id -u)"; mkdir -p "\$XDG_RUNTIME_DIR"; chmod 700 "\$XDG_RUNTIME_DIR"
+$gpuenv
 vncserver -kill :1 >/dev/null 2>&1 || true
 rm -f /tmp/.X1-lock /tmp/.X11-unix/X1
 vncserver :1 -geometry "$geo" -depth 24 -noreset || exit 1
@@ -327,11 +373,15 @@ EOS
   chmod +x "$rootfs/root/.boxgui-run.sh"
   [ "$(wakestat)" = on ] || wakeon || true
   # Launch via bash -c '…"$2"…' _ "$alias" "$PWD" "$tgt": the host path arrives as argv, expanded once, so any
-  # space/$/quote/backtick in it stays literal (no re-parsed launch-script path).
+  # space/$/quote/backtick in it stays literal (no re-parsed launch-script path). The GPU socket is a 4th, optional
+  # bind, spliced in with printf %q (it IS re-parsed, so it must arrive already quoted).
+  # ONLY the socket is bound — not the whole $TMPDIR (--shared-tmp), which would shadow the box's own /tmp (hiding the
+  # Xvnc socket) and hand the box read/write over the host tmp dir.
+  [ -n "$sock" ] && gbind=$(printf -- '--bind %q:/tmp/.virgl_test' "$sock")
   if [ "$mnt" = none ]; then
-    tmux new -ds ab-boxgui bash -c 'exec proot-distro login "$1" --isolated -- bash /root/.boxgui-run.sh' _ "$alias"
+    tmux new -ds ab-boxgui bash -c 'exec proot-distro login "$1" --isolated '"$gbind"' -- bash /root/.boxgui-run.sh' _ "$alias"
   else
-    tmux new -ds ab-boxgui bash -c 'exec proot-distro login "$1" --isolated --bind "$2:$3" -- bash /root/.boxgui-run.sh' _ "$alias" "$PWD" "$tgt"
+    tmux new -ds ab-boxgui bash -c 'exec proot-distro login "$1" --isolated --bind "$2:$3" '"$gbind"' -- bash /root/.boxgui-run.sh' _ "$alias" "$PWD" "$tgt"
   fi
   sleep 3
   tmux has-session -t "=ab-boxgui" 2>/dev/null \
@@ -344,6 +394,9 @@ EOS
   [ "$app" = browser ] && kv "  browser" "chromium (opens in the desktop; reopen from the menu if closed)" "$G" \
     || kv "  VS Code" "http://localhost:$GUI_BOXCODE" "$G"
   [ "$mitm" = 1 ] && kv "  mitmweb UI" "http://localhost:8083 (open in the box browser)" "$Y"
+  [ "$gpu" = virgl ] && { [ -n "$sock" ] \
+    && kv "  GPU" "virgl → the phone's GPU (check in a desktop terminal: glxinfo -B)" "$G" \
+    || kv "  GPU" "virgl asked for but unavailable — running on CPU (llvmpipe)" "$Y"; }
   kv "  password (both)" "$pw" "$G"
   kv "  close it" "ab stop  (keeps the box; reopen with ab $prof)" "$Y"
   kv "  rebuild fresh" "ab remove $prof  (delete, then ab $prof)" "$Y"; return 0; }
@@ -365,7 +418,7 @@ ABC
     || printf '\n[ -f /etc/profile.d/agentbox-colour.sh ] && . /etc/profile.d/agentbox-colour.sh  # agentbox-colour\n' >> "$r/etc/bash.bashrc"; }
 # `ab <name> [cmd]` — build box <name> from its profile if missing, then run it scoped to the cwd.
 abox(){ local prof="$1"; shift; local cmd="$*" cf alias rootfs \
-    INSTALL= TOKENS= RUN= MOUNT=cwd EPHEMERAL=0 DESKTOP= APP=code MITM=0 LAN=0 AGENT= PKGS= DIST= ef efn rc tgt run incmd mitmblock= ms=
+    INSTALL= TOKENS= RUN= MOUNT=cwd EPHEMERAL=0 DESKTOP= APP=code MITM=0 LAN=0 GPU= AGENT= PKGS= DIST= ef efn rc tgt run incmd mitmblock= ms=
   case "$prof" in host-*)                                        # host-* is a host tmux session, never a box (no profile, no proot)
     if [ -z "$cmd" ] && [ -t 1 ] && [ -z "${TMUX:-}" ] && [ "${AB_NO_SESSION:-}" != 1 ]; then sessrun "$prof"; return $?; fi
     if [ -n "$cmd" ]; then exec "${SHELL:-bash}" -lc "$cmd"; else exec "${SHELL:-bash}" -l; fi;;
@@ -393,8 +446,11 @@ abox(){ local prof="$1"; shift; local cmd="$*" cf alias rootfs \
   fi
   rootfs=$(pdroot "$alias"); [ -n "$rootfs" ] || { msg "box '$prof' not built" "$R"; return 1; }
   boxcolour "$rootfs"                                            # colour the box's shell (ls/grep/prompt + 256-colour TERM)
+  case "${GPU:-}" in ''|virgl) :;;                               # GPU= is desktop-only and has exactly one value today
+    *) msg "profile '$prof': unknown GPU='$GPU' (use virgl, or leave it empty for CPU) — ignoring" "$Y"; GPU=;; esac
+  [ -n "$GPU" ] && [ -z "$DESKTOP" ] && { msg "note: GPU=$GPU applies to a DESKTOP box only — ignored here" "$Y"; GPU=; }
   # DESKTOP set → run a scoped desktop (background); nothing after this runs for a GUI box.
-  [ -n "$DESKTOP" ] && { aboxgui "$prof" "$alias" "$rootfs" "$APP" "$MOUNT" "$MITM" "$LAN"; return $?; }
+  [ -n "$DESKTOP" ] && { aboxgui "$prof" "$alias" "$rootfs" "$APP" "$MOUNT" "$MITM" "$LAN" "$GPU"; return $?; }
   run="${cmd:-$RUN}"; [ "$MITM" = 1 ] && ms='; mitm on'
   ef="$rootfs/root/.abenv.$$"; efn=".abenv.$$"     # token file lives inside the isolated rootfs; nothing else is bound
   ( umask 077; aboxenv "$TOKENS" > "$ef" )
@@ -781,7 +837,8 @@ fontinstall(){ [ "${AGENTBOX_FONT_URL:-}" = none ] && return 0
       msg "font installed → $f (override: AGENTBOX_FONT_URL=<ttf url>, skip: AGENTBOX_FONT_URL=none)" "$G"
     else msg "font download looks invalid (too small) — keeping the current font" "$Y"; rm -f "$tmp"; fi
   else msg "font download failed — keeping the current font" "$Y"; rm -f "$tmp"; fi; }
-# Extra-keys row incl. ⇧⇥ (Shift+Tab → how Claude Code cycles normal/auto-accept/plan). Managed block; backs up once.
+# Extra-keys row, tuned for a TUI agent inside tmux: ⇧⇥ (Claude Code mode cycle), ⏎↵ (newline, no submit), ^C, tmux
+# detach + scroll, and HOME/END/PGUP/PGDN folded onto arrow long-press. Managed block; backs the original up once.
 termuxprops(){ [ "${AGENTBOX_EXTRA_KEYS:-}" = none ] && return 0
   local f=~/.termux/termux.properties; mkdir -p ~/.termux
   [ -f "$f" ] && [ ! -f "$f.bak" ] && cp "$f" "$f.bak"
@@ -791,16 +848,24 @@ termuxprops(){ [ "${AGENTBOX_EXTRA_KEYS:-}" = none ] && return 0
   else
     cat >> "$f" <<'EOF'
 #AGENTBOX-EXTRA-KEYS (managed — re-run `ab setup` to refresh; edit ABOVE this line to keep changes)
-# ⇧⇥ = Shift+Tab, cycles Claude Code modes (normal / auto-accept / plan).
+# Tuned for driving a TUI agent inside tmux from a phone. Every key that left this row is still here as a LONG-PRESS:
+#   / → ~    - → |    ↑ → PGUP    ↓ → PGDN    ← → HOME    → → END
+# Macro keys (one tap instead of a 3-tap chord through the sticky CTRL toggle):
+#   ⇧⇥  Shift+Tab   cycles Claude Code modes (normal / auto-accept / plan)
+#   ⏎↵  \ + Enter   newline WITHOUT submitting — multi-line prompts
+#   ^C  Ctrl-C      interrupt
+#   det Ctrl-b d    detach the tmux session (ab session reattaches)
+#   scr Ctrl-b [    tmux copy-mode: scroll back with the arrows (this config runs 'mouse off')
+# CTRL/ALT/ESC each appear exactly ONCE as a standalone key — Termux misbehaves when a 'special key' is listed twice.
 extra-keys = [[ \
-  ESC, TAB, {macro: "SHIFT TAB", display: "⇧⇥"}, CTRL, HOME, UP, END, PGUP \
+  ESC, TAB, {macro: "SHIFT TAB", display: "⇧⇥"}, CTRL, ALT, {key: UP, popup: PGUP}, {macro: "CTRL c", display: "^C"}, {macro: "CTRL b d", display: "det"} \
 ], [ \
-  {key: "/", popup: "~"}, {key: "-", popup: "|"}, ALT, KEYBOARD, LEFT, DOWN, RIGHT, PGDN \
+  {key: "/", popup: "~"}, {key: "-", popup: "|"}, KEYBOARD, {macro: "BACKSLASH ENTER", display: "⏎↵"}, {key: LEFT, popup: HOME}, {key: DOWN, popup: PGDN}, {key: RIGHT, popup: END}, {macro: "CTRL b [", display: "scr"} \
 ]]
 EOF
   fi
   has termux-reload-settings && termux-reload-settings
-  msg "extra-keys deployed → $f (⇧⇥ = Shift+Tab; original at $f.bak)" "$G"; }
+  msg "extra-keys deployed → $f  (⇧⇥ modes · ⏎↵ newline · ^C · det = detach · scr = scroll; long-press an arrow for HOME/END/PGUP/PGDN; original at $f.bak)" "$G"; }
 # sshd: Termux is single-user and accepts any username; password auth stays on only until a key is enrolled, then key-only.
 sshauth(){ local sc="$PREFIX/etc/ssh/sshd_config" pa=yes
   grep -Eq '^[^#[:space:]]' ~/.ssh/authorized_keys 2>/dev/null && pa=no
@@ -859,7 +924,7 @@ unkill(){ local t="${AGENTBOX_TTY:-/dev/tty}" pport cport code v
 setup(){ local t="${AGENTBOX_TTY:-/dev/tty}" ans i=0 tot cmd title why rest s; local -a steps
   steps=(
     "links|put agentbox on PATH|Creates the ab / agentbox commands in \$PREFIX/bin (only runs if they're missing)."
-    "init|set up Termux|Glyph font + extra-keys row (⇧⇥/arrows), updates Termux, installs proot-distro, starts sshd on 8022, and self-heals the host shell after an ssh drop (no more mouse-code spill)."
+    "init|set up Termux|Glyph font + extra-keys row (⇧⇥ · ⏎↵ · ^C · tmux detach/scroll), updates Termux, installs proot-distro, starts sshd on 8022, and self-heals the host shell after an ssh drop (no more mouse-code spill)."
     "tmux|tmux config|Applies the managed tmux config (mouse off + TUI-friendly keys)."
     "unkill|stop Android killing the box|Disables the phantom-process killer via on-device adb (Android 12+, guided)."
     "env|add your API tokens|You'll be asked for each token in turn; press Enter to leave one unchanged."
@@ -948,7 +1013,8 @@ usage(){
     row "$(printf '%-7s' "$(basename "$tf" .conf)")" "v$(tplver "$tf")" "$(tpldesc "$tf")"
   done
   hd "▍Notes"
-  nt profile  "$(short "$VC")/profile/<name>.conf — AGENT·PKGS·TOKENS·RUN·MOUNT·EPHEMERAL·DESKTOP·APP·MITM·LAN·DIST  (docker: set INSTALL='…')"
+  nt profile  "$(short "$VC")/profile/<name>.conf — AGENT·PKGS·TOKENS·RUN·MOUNT·EPHEMERAL·DESKTOP·APP·MITM·LAN·GPU·DIST  (docker: set INSTALL='…')"
+  nt gpu      "GPU=virgl (desktop boxes) renders GL on the phone's GPU via a Termux-side server — opt-in, CPU if unavailable"
   nt tokens   "$(short "$ENVF")  (0600; only a profile's TOKENS keys are injected; AGENTBOX_* excluded)"
   nt reserved "run save restore remove rm rebuild upgrade stop pw pkg setup update sync session help version ls list"
   nt shadow   "a box whose name is a reserved word runs only via 'ab run <name>' — the 'ab <name>' shorthand is taken"
