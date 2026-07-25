@@ -1,6 +1,6 @@
 #!/data/data/com.termux/files/usr/bin/bash
 # Version — single source of truth; the installer greps ^VERSION= (keep the line bare, no trailing comment).
-VERSION=3.18.0
+VERSION=3.19.0
 # agentbox — throwaway, folder-scoped AI-agent boxes for a phone (Android Termux + proot-distro ONLY).
 #
 # THREAT MODEL: this protects YOUR FILES from *accidents* (an agent touching the wrong folder), not from a hostile
@@ -156,6 +156,26 @@ aboxdefault(){ local path="$1" name="$2" src="$TPL/$2.conf"   # NB: $2, not $nam
   else ( umask 077; builtin_default_profile > "$path" )   # no valid template → the built-in default (a CLAUDE box)
     msg "no '$name' template found — seeded $(short "$path") from the built-in default, which is a CLAUDE box. If you expected a shipped template ('$name'), run 'ab update' to (re)fetch it, then: ab remove $name && ab $name" "$Y"
   fi; }
+# Every name ab already knows — your profiles + the shipped templates, deduped. Printed when an unknown name is typed,
+# so a typo ('clade') is spotted against the real ones instead of silently becoming a new box.
+aboxknown(){ local f b out=; for f in "$VC"/profile/*.conf "$TPL"/*.conf; do [ -e "$f" ] || continue
+    b=$(basename "$f" .conf); case " $out " in *" $b "*) continue;; esac; out="$out $b"; done
+  printf '%s\n' "${out# }" | sed 's/ / · /g'; }
+# `ab <name>` with no profile of that name is BOTH how a box is created and what a typo looks like — and creating one
+# downloads a few hundred MB. So ask first: Enter (or y) creates, n/q cancels before anything is written or fetched.
+# Default-yes keeps the intended path to a single extra keystroke. Creates straight away, no question asked, when:
+# AB_YES=1 (scripts/cron), there is no terminal to ask on, or the rootfs is already built and only the conf went missing.
+aboxnewok(){ local prof="$1" t="${AGENTBOX_TTY:-/dev/tty}" src="$TPL/$1.conf" a from known
+  [ "${AB_YES:-}" = 1 ] && return 0
+  [ -n "$(pdroot "$(aboxalias "$prof")")" ] && return 0
+  ( : < "$t" ) 2>/dev/null || return 0                            # no controlling terminal → old behaviour, just create
+  if [ -f "$src" ]; then from="the '$prof' template"
+  else from="the built-in default (a claude box)"
+    known=$(aboxknown); [ -n "$known" ] && printf '%sknown names: %s%s\n' "$DM" "$known" "$Z" > "$t"
+  fi
+  printf "%sno box '%s' yet — create it from %s? [Y/n] %s" "$Y" "$prof" "$from" "$Z" > "$t"
+  IFS= read -r a < "$t" || a=n
+  case "$a" in [NnQq]*) msg "cancelled — nothing created" "$Y"; return 1;; esac; return 0; }
 # Kill every process whose executable lives inside a box's rootfs — daemonised Xvnc/chromium/mitmweb outlive the tmux
 # session (proot is ptrace-based, not a chroot, so /proc/<pid>/exe still resolves to the real rootfs path). Host-side.
 boxkillprocs(){ local rootfs="$1" p exe; [ -n "$rootfs" ] && [ -d "$rootfs" ] || return 0
@@ -424,15 +444,17 @@ abox(){ local prof="$1"; shift; local cmd="$*" cf alias rootfs \
     if [ -n "$cmd" ]; then exec "${SHELL:-bash}" -lc "$cmd"; else exec "${SHELL:-bash}" -l; fi;;
   esac
   cf=$(aboxconf "$prof"); alias=$(aboxalias "$prof")
-  has proot-distro || pkg install -y proot-distro || { msg "proot-distro install failed" "$R"; return 1; }
   if [ -f "$cf" ]; then                                         # existing copy: warn if the pristine template moved past it
     local cv tv src="$TPL/$prof.conf"; cv=$(tplver "$cf"); tv=$(tplver "$src" 2>/dev/null)
     [ -n "$cv" ] && [ -n "$tv" ] && [ "$cv" != "$tv" ] \
       && msg "note: $(short "$cf") is from the $prof template v$cv; the current template is v$tv — it changed since, worth a look" "$Y"
-  else mkdir -p "$(dirname "$cf")"; aboxdefault "$cf" "$prof" || return 1
+  else aboxnewok "$prof" || return 1                            # unknown name → confirm (Enter = yes) before creating anything
+    mkdir -p "$(dirname "$cf")"; aboxdefault "$cf" "$prof" || return 1
     case " run save restore remove rm rebuild upgrade stop pw pkg setup update sync session help version ls list " in
       *" $prof "*) msg "note: '$prof' is also an ab command — run this box with 'ab run $prof' ('ab $prof' triggers the command instead)" "$Y";; esac
     msg "new profile $(short "$cf") — binds only the launch folder, injects only its tokens (edit it directly)" "$Y"; fi
+  # After the profile step, so a mistyped name never triggers a package install (nothing above this needs proot-distro).
+  has proot-distro || pkg install -y proot-distro || { msg "proot-distro install failed" "$R"; return 1; }
   . "$cf"; mkenv
   # Auto-session: an interactive, command-less CLI box opens a fresh tmux session each launch (survives ssh-drop;
   # reattach earlier ones with 'ab session'). Explicit cmd / piped output / in tmux / desktop box → foreground. Off: AB_NO_SESSION=1.
@@ -1014,6 +1036,7 @@ usage(){
   done
   hd "▍Notes"
   nt profile  "$(short "$VC")/profile/<name>.conf — AGENT·PKGS·TOKENS·RUN·MOUNT·EPHEMERAL·DESKTOP·APP·MITM·LAN·GPU·DIST  (docker: set INSTALL='…')"
+  nt new      "a name with no profile yet asks before creating the box — Enter = yes, n = cancel (AB_YES=1 skips the ask)"
   nt gpu      "GPU=virgl (desktop boxes) renders GL on the phone's GPU via a Termux-side server — opt-in, CPU if unavailable"
   nt tokens   "$(short "$ENVF")  (0600; only a profile's TOKENS keys are injected; AGENTBOX_* excluded)"
   nt reserved "run save restore remove rm rebuild upgrade stop pw pkg setup update sync session help version ls list"
