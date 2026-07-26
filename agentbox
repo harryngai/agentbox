@@ -1,6 +1,6 @@
 #!/data/data/com.termux/files/usr/bin/bash
 # Version — single source of truth; the installer greps ^VERSION= (keep the line bare, no trailing comment).
-VERSION=3.22.0
+VERSION=3.23.0
 # agentbox — throwaway, folder-scoped AI-agent boxes for a phone (Android Termux + proot-distro ONLY).
 #
 # THREAT MODEL: this protects YOUR FILES from *accidents* (an agent touching the wrong folder), not from a hostile
@@ -771,15 +771,20 @@ boxremove(){ local prof="${1:-}" a snap cf; [ -n "$prof" ] || { msg "which box? 
   fi; return 0; }
 
 # ── Package helper (simple-mode profiles) ──────────────────────────
-# `ab pkg <name> search <term>` lists matches from the built box's apt catalog; `add`/`rm <pkg…>` edit the profile's
-# PKGS= line (rebuild to apply); bare/ls prints it. Docker-mode profiles (INSTALL set) ignore PKGS — a note is shown.
-abpkg(){ local prof="${1:-}" verb cf a cur new p tmp; [ $# -gt 0 ] && shift; verb="${1:-ls}"; [ $# -gt 0 ] && shift
+# `ab pkg <name> search <term>` lists matches from the built box's apt catalog and then offers to add + apply them
+# (see pkgoffer); `add`/`rm <pkg…>` edit the profile's PKGS= line; bare/ls prints it. Docker-mode profiles (INSTALL
+# set) ignore PKGS — a note is shown.
+abpkg(){ local prof="${1:-}" verb cf a cur new p tmp hits; [ $# -gt 0 ] && shift; verb="${1:-ls}"; [ $# -gt 0 ] && shift
   cf=$(aboxconf "$prof"); a=$(aboxalias "$prof")
   [ -n "$prof" ] || { msg "usage: ab pkg <name> [ls | add <pkg…> | rm <pkg…> | search <term>]" "$Y"; return 1; }
   case "$verb" in
     search) [ -n "${1:-}" ] || { msg "usage: ab pkg $prof search <term>" "$Y"; return 1; }
       [ -n "$(pdroot "$a")" ] || { msg "build '$prof' first (ab $prof) — search reads its apt catalog" "$Y"; return 1; }
-      proot-distro login "$a" -- sh -c 'apt-cache search -- "$1" 2>/dev/null | sort | head -40' _ "$1";;
+      hits=$(proot-distro login "$a" -- sh -c 'apt-cache search -- "$1" 2>/dev/null | sort | head -40' _ "$1")
+      [ -n "$hits" ] || { msg "no match for '$1' in '$prof' apt catalog (it may be pip/npm-only, or the lists are stale — ab upgrade $prof)" "$Y"; return 1; }
+      printf '%s\n' "$hits"
+      [ -f "$cf" ] || { msg "no profile '$prof' — nothing to add it to" "$Y"; return 0; }
+      pkgoffer "$prof" "$1" "$hits";;
     add|rm) [ -n "${1:-}" ] || { msg "usage: ab pkg $prof $verb <pkg…>" "$Y"; return 1; }
       [ -f "$cf" ] || { msg "no profile '$prof' yet — create it: ab $prof" "$Y"; return 1; }
       [ -n "$( . "$cf" 2>/dev/null; printf %s "$INSTALL" )" ] && msg "note: '$prof' is docker mode (INSTALL set) — PKGS is ignored" "$Y"
@@ -788,11 +793,61 @@ abpkg(){ local prof="${1:-}" verb cf a cur new p tmp; [ $# -gt 0 ] && shift; ver
       new=$(printf %s "$new" | tr ' ' '\n' | awk 'NF&&!s[$0]++' | paste -sd' ' -)
       if grep -q '^PKGS=' "$cf"; then tmp=$(mktemp); sed "s|^PKGS=.*|PKGS=\"$new\"|" "$cf" > "$tmp" && mv "$tmp" "$cf"
       else printf 'PKGS="%s"\n' "$new" >> "$cf"; fi
-      msg "PKGS = ${new:-(empty)} · rebuild to apply: ab remove $prof && ab $prof" "$G";;
+      msg "PKGS = ${new:-(empty)} · apply in place: ab upgrade $prof  (or a clean rebuild: ab rebuild $prof)" "$G";;
     ls|"") [ -f "$cf" ] || { msg "no profile '$prof' yet" "$Y"; return 1; }
       kv "$prof PKGS" "$( . "$cf" 2>/dev/null; printf %s "${PKGS:-(none)}")";;
     *) msg "usage: ab pkg <name> [ls | add <pkg…> | rm <pkg…> | search <term>]" "$Y"; return 1;;
   esac; }
+
+# After a search, close the loop instead of leaving the two steps that matter to hand-typing. pkgoffer names the
+# package the term points at, adds what belongs BESIDE it but is not a dependency of it (a python3-* library depends
+# on python3 and never on pip — install openpyxl alone and the box still can't `pip install` the next one), states
+# what each one is IN THE BOX RIGHT NOW from apt's own policy (new · a → b upgrade · current), and offers to write
+# them into PKGS and apply them with `ab upgrade`. Already installed is NOT a reason to go quiet: a newer candidate
+# is exactly the case worth offering, so the prompt appears whenever anything would be installed, upgraded, or is
+# missing from PKGS. Enter/y does it, n prints the command and changes nothing, no terminal → print only (a search
+# in a script must not silently mutate a box; AB_YES=1 is the explicit opt-in). Docker-mode profiles are told to edit
+# INSTALL= instead — offering PKGS there would promise something the build ignores.
+pkgmates(){ case "${1:-}" in                    # what belongs beside a package but isn't pulled in by it — certain cases only
+    python3-*) printf 'python3 python3-pip';;
+    ruby-*)    printf 'ruby';;
+    php-*)     printf 'php-cli';;
+  esac; }
+pkgpick(){ local term="$1" names="$2" n best=   # exact name > python3-<term> > shortest name containing the term (-doc/-dev lose)
+  case " $names " in *" $term "*) printf %s "$term"; return;; esac
+  case " $names " in *" python3-$term "*) printf %s "python3-$term"; return;; esac
+  for n in $names; do case "$n" in *"$term"*) { [ -z "$best" ] || [ "${#n}" -lt "${#best}" ]; } && best="$n";; esac; done
+  printf %s "${best:-${names%% *}}"; }
+pkgoffer(){ local prof="$1" term="$2" hits="$3" t="${AGENTBOX_TTY:-/dev/tty}" a cf cur names cand want keep= out pol p i c todo=0 miss= nins ans
+  cf=$(aboxconf "$prof")
+  [ -n "$( . "$cf" 2>/dev/null; printf %s "$INSTALL" )" ] \
+    && { msg "'$prof' is docker mode (INSTALL set) — PKGS is ignored; put the install step in INSTALL= yourself" "$Y"; return 0; }
+  a=$(aboxalias "$prof"); names=$(printf '%s\n' "$hits" | awk '{print $1}' | paste -sd' ' -)
+  cand=$(pkgpick "$term" "$names")
+  want=$(printf '%s %s' "$(pkgmates "$cand")" "$cand" | tr ' ' '\n' | awk 'NF&&!s[$0]++' | paste -sd' ' -)
+  # ONE trip into the box for both answers: per-package state (policy) and how big the install really is (simulate).
+  out=$(proot-distro login "$a" -- sh -c 'apt-cache policy -- "$@" 2>/dev/null; echo @@; apt-get install -s -y -- "$@" 2>/dev/null' _ $want)
+  pol=$(printf '%s\n' "${out%%@@*}" | awk '/^[^ ]+:$/{n=substr($0,1,length($0)-1)} /^ *Installed:/{i=$2} /^ *Candidate:/{print n"\t"i"\t"$2}')
+  nins=$(printf '%s\n' "${out#*@@}" | grep -c '^Inst ')
+  printf '\n'; kv "$prof would add" "$want" "$BD"
+  for p in $want; do case $'\n'"$pol" in *$'\n'"$p"$'\t'*) keep="$keep $p";; *) kv "  $p" "unknown to this box's apt — skipped" "$R";; esac; done
+  want="${keep# }"; [ -n "$want" ] || { msg "nothing addable" "$Y"; return 1; }
+  while IFS=$'\t' read -r p i c; do [ -n "$p" ] || continue                    # herestring, not a pipe: todo must survive the loop
+    if [ "$i" = "(none)" ]; then kv "  $p" "$c · new" "$G"; todo=1
+    elif [ "$i" != "$c" ]; then kv "  $p" "$i → $c · upgrade" "$G"; todo=1
+    else kv "  $p" "$i · current" "$DM"; fi
+  done <<< "$pol"
+  [ "${nins:-0}" -gt 0 ] && kv "apt would install" "$nins package(s), dependencies included"
+  cur=$( . "$cf" 2>/dev/null; printf %s "$PKGS" )
+  for p in $want; do case " $cur " in *" $p "*) ;; *) miss=1;; esac; done
+  [ -z "$miss" ] && [ "$todo" = 0 ] && { msg "already in PKGS and current — nothing to do" "$DM"; return 0; }
+  msg "  (ab upgrade also apt-upgrades the rest of the box; the desktop stack is untouched)" "$DM"
+  if [ "${AB_YES:-}" = 1 ]; then ans=y
+  elif ( : < "$t" ) 2>/dev/null; then
+    printf "%sadd to '%s' PKGS and upgrade the box now? [Y/n] %s" "$Y" "$prof" "$Z" > "$t"; IFS= read -r ans < "$t" || ans=n
+  else msg "to apply: ab pkg $prof add $want && ab upgrade $prof" "$DM"; return 0; fi
+  case "$ans" in [NnQq]*) msg "not added — ab pkg $prof add $want && ab upgrade $prof" "$Y"; return 0;; esac
+  abpkg "$prof" add $want && boxupgrade "$prof"; }
 
 # ── Snapshot / golden image ────────────────────────────────────────
 # Golden image of a box rootfs (SYSTEM state only — your folders live outside and are untouched). Stored host-side in
@@ -1278,7 +1333,7 @@ usage(){
   row stop    ""          "close the running box desktop — keeps the box (ab remove = delete + rebuild)"
   row ps      "[kill]"    "what agentbox is running NOW — CPU per box + battery verdict; kill clears strays"
   row "pw <name>" "[password]" "set/show a desktop box's login password (else it's random each launch)"
-  row "pkg <name>" "[add|rm|search]" "edit a simple profile's PKGS or search its apt catalog (rebuild to apply)"
+  row "pkg <name>" "[add|rm|search]" "search the box's apt catalog — then offers to add + 'ab upgrade' it; add/rm edit PKGS"
   hd "▍Sessions" "(interactive 'ab <name>' opens a fresh one each launch; auto wakelock)"
   row session "[name]"    "no arg = list EVERY tmux session to reattach/kill"
   row "" ""               "  name = open a new session here (host-* → a host shell, not a box)"
