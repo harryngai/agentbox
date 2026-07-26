@@ -59,7 +59,7 @@ fi
 # on first use. Re-running install.sh refreshes these pristine templates without touching your edited copies in ~/.config.
 TPLDIR="$(dirname "$DEST")/templates"
 mkdir -p "$TPLDIR"
-TEMPLATES="claude codex copilot run web desktop"
+TEMPLATES="claude codex copilot web desktop"
 tpl_ok=1; tpls=
 for t in $TEMPLATES; do
   if fetch "$BASE/templates/$t.conf" "$TPLDIR/$t.conf" \
@@ -68,7 +68,7 @@ for t in $TEMPLATES; do
     tpls="${tpls:+$tpls, }$t ${v:-?}"
   else err "  template '$t' failed or looks wrong (404/HTML?)"; rm -f "$TPLDIR/$t.conf"; tpl_ok=; fi
 done
-# Prune orphaned pristine templates (e.g. one renamed/removed upstream, like shell→run) so `ab <name>` only offers the
+# Prune orphaned pristine templates (e.g. one removed upstream, like 'run' — `ab <name> bash` replaced it) so `ab <name>` only offers the
 # current set. Guarded on tpl_ok so a failed fetch can't wipe the dir. Your edited copies in ~/.config are never touched.
 if [ -n "$tpl_ok" ]; then
   for f in "$TPLDIR"/*.conf; do [ -e "$f" ] || break; b=$(basename "$f" .conf)

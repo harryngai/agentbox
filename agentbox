@@ -1,6 +1,6 @@
 #!/data/data/com.termux/files/usr/bin/bash
 # Version — single source of truth; the installer greps ^VERSION= (keep the line bare, no trailing comment).
-VERSION=3.23.0
+VERSION=3.24.0
 # agentbox — throwaway, folder-scoped AI-agent boxes for a phone (Android Termux + proot-distro ONLY).
 #
 # THREAT MODEL: this protects YOUR FILES from *accidents* (an agent touching the wrong folder), not from a hostile
@@ -46,6 +46,17 @@ dw(){ local s="$1" w=0 i ch; for ((i=0;i<${#s};i++)); do ch=${s:i:1}
     [!$'\x01'-$'\x7f']) w=$((w+2));;
     *) w=$((w+1));;
   esac; done; echo $w; }
+# Word-wrap $2 to the terminal, hanging every continuation line under a $1-column indent. Widths come from dw(), so a
+# '·' or '→' costs the one cell it prints. Without this the long ▍Notes lines wrapped back to column 0 on a phone and
+# the block stopped reading as a list. Globbing is off while splitting: the text carries paths and '*' is not a glob here.
+wrap(){ local ind="$1" w word ww line= lw=0 out= pad g=; case $- in *f*) g=1;; esac; set -f
+  pad=$(printf '%*s' "$ind" ''); w=$(( ${cols:-80} - ind )); [ "$w" -lt 24 ] && w=24
+  for word in $2; do ww=$(dw "$word")
+    if [ -z "$line" ]; then line="$word"; lw=$ww
+    elif [ $((lw + 1 + ww)) -le "$w" ]; then line="$line $word"; lw=$((lw + 1 + ww))
+    else out="$out$line"$'\n'"$pad"; line="$word"; lw=$ww; fi
+  done
+  [ -n "$g" ] || set +f; printf '%s%s' "$out" "$line"; }
 kv(){ local n=$((20-$(dw "$1"))); ((n<0)) && n=0
   printf '%s%*s: %s%s%s\n' "$1" "$n" '' "${3:-}" "$2" "$Z"; }
 # Status row (boxls): 2-space indent, bold key, no colon — aligns with the help's row() so bare `ab` reads as one doc.
@@ -687,7 +698,8 @@ ABC
 abox(){ local prof="$1"; shift; local cmd="$*" cf alias rootfs \
     INSTALL= TOKENS= RUN= MOUNT=cwd EPHEMERAL=0 DESKTOP= APP=code MITM=0 LAN=0 RFB=0 GPU= AGENT= PKGS= DIST= ef efn rc tgt run incmd mitmblock= ms=
   case "$prof" in host-*)                                        # host-* is a host tmux session, never a box (no profile, no proot)
-    if [ -z "$cmd" ] && [ -t 1 ] && [ -z "${TMUX:-}" ] && [ "${AB_NO_SESSION:-}" != 1 ]; then sessrun "$prof"; return $?; fi
+    case "$cmd" in -*) msg "'$cmd' is a flag, not a command — a host shell has no RUN to attach it to (ab $prof <cmd> $cmd)" "$R"; return 1;; esac
+    if [ -t 1 ] && [ -z "${TMUX:-}" ] && [ "${AB_NO_SESSION:-}" != 1 ] && sesscmd "$cmd"; then sessrun "$prof" "$@"; return $?; fi
     if [ -n "$cmd" ]; then exec "${SHELL:-bash}" -lc "$cmd"; else exec "${SHELL:-bash}" -l; fi;;
   esac
   cf=$(aboxconf "$prof"); alias=$(aboxalias "$prof")
@@ -703,10 +715,22 @@ abox(){ local prof="$1"; shift; local cmd="$*" cf alias rootfs \
   # After the profile step, so a mistyped name never triggers a package install (nothing above this needs proot-distro).
   has proot-distro || pkg install -y proot-distro || { msg "proot-distro install failed" "$R"; return 1; }
   . "$cf"; mkenv
-  # Auto-session: an interactive, command-less CLI box opens a fresh tmux session each launch (survives ssh-drop;
-  # reattach earlier ones with 'ab session'). Explicit cmd / piped output / in tmux / desktop box → foreground. Off: AB_NO_SESSION=1.
-  if [ -z "$DESKTOP" ] && [ -z "$cmd" ] && [ -t 1 ] && [ -z "${TMUX:-}" ] && [ "${AB_NO_SESSION:-}" != 1 ]; then
-    sessrun "$prof"; return $?
+  # What actually runs in the box. A cmd REPLACES the profile's RUN — except one that starts with a flag, which is
+  # added to it: `ab claude --continue`, not `ab claude claude --continue`. A flag can't be a program name, so there
+  # is nothing ambiguous about the two cases. (Computed here, before the session decision, so both agree on it.)
+  case "$cmd" in
+    -*) [ -n "$RUN" ] || { msg "'$prof' has no RUN for '$cmd' to attach to — name the command: ab $prof <cmd> $cmd" "$R"; return 1; }
+        run="$RUN$(printf ' %q' "$@")";;   # %q per ARG here (unlike the replace case below, which is a flat string):
+                                            # these are flags and their values, so `ab claude -p "two words"` stays ONE argument
+    *)  run="${cmd:-$RUN}";;
+  esac
+  # Auto-session: an interactive CLI box opens a fresh tmux session each launch (survives ssh-drop; reattach earlier
+  # ones with 'ab session'). No cmd → always, whatever RUN is. A cmd → only when it is one you SIT in (see sesscmd),
+  # so `ab claude bash` gets a session exactly like `ab claude` does. Piped output / already in tmux / desktop box →
+  # foreground. Never: AB_NO_SESSION=1; always (any cmd): AB_SESSION=1.
+  if [ -z "$DESKTOP" ] && [ -t 1 ] && [ -z "${TMUX:-}" ] && [ "${AB_NO_SESSION:-}" != 1 ] \
+     && { [ -z "$cmd" ] || sesscmd "$run"; }; then
+    sessrun "$prof" "$@"; return $?
   fi
   # Build when missing; a non-desktop EPHEMERAL box rebuilds fresh each run (desktop boxes only when missing — too heavy).
   if { [ -z "$DESKTOP" ] && [ "$EPHEMERAL" = 1 ]; } || [ -z "$(pdroot "$alias")" ]; then
@@ -725,7 +749,7 @@ abox(){ local prof="$1"; shift; local cmd="$*" cf alias rootfs \
     *) msg "profile '$prof': DESKTOP='$DESKTOP' isn't a session ab knows (xfce|kde) — building/running it as xfce" "$Y";; esac
   # DESKTOP set → run a scoped desktop (background); nothing after this runs for a GUI box.
   [ -n "$DESKTOP" ] && { aboxgui "$prof" "$alias" "$rootfs" "$APP" "$MOUNT" "$MITM" "$LAN" "$GPU" "$RFB" "$DESKTOP"; return $?; }
-  run="${cmd:-$RUN}"; [ "$MITM" = 1 ] && ms='; mitm on'
+  [ "$MITM" = 1 ] && ms='; mitm on'
   ef="$rootfs/root/.abenv.$$"; efn=".abenv.$$"     # token file lives inside the isolated rootfs; nothing else is bound
   ( umask 077; aboxenv "$TOKENS" > "$ef" )
   if [ "$MITM" = 1 ]; then mitmblock='mitmweb --mode regular --listen-host 127.0.0.1 --listen-port 8082 --web-host 127.0.0.1 --web-port 8083 --set web_open_browser=false >/tmp/mitmweb.log 2>&1 &
@@ -1026,6 +1050,21 @@ sesspick(){ local mode="${1:-enter}" names=() dates=() paths=() n cr path i c ma
   anysession || { [ "$(wakestat)" = on ] && wakeoff; }; return 0; }
 # Simplified kebab-case of a path's last component (or a box name): lowercase, non-alnum → '-', collapsed/trimmed.
 slug(){ local s; s=$(printf '%s' "${1##*/}" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9' '-' | sed 's/-\{2,\}/-/g; s/^-//; s/-$//'); printf '%s' "${s:-x}"; }
+# Does this command deserve its own session? Only if it is one you SIT in — judged on its first word: a shell, a CLI
+# agent, a REPL. Everything else stays in the foreground ON PURPOSE: a one-shot's output dies with the pane the
+# instant it exits (tmux restores the screen), and `ab claude "npm test"` is output you want to read.
+# The one-shot flag differs per family, and they collide — `bash -c …` is a one-shot while `claude -c` RESUMES a
+# session, so the test is made inside each family, never across all of them. AB_SESSION=1 forces a session for any
+# command; AB_NO_SESSION=1 (checked by the caller) never opens one.
+sesscmd(){ local c="${1:-}" w
+  [ -z "$c" ] && return 0
+  [ "${AB_SESSION:-}" = 1 ] && return 0
+  w=${c%%[[:space:]]*}; w=${w##*/}
+  case "$w" in
+    claude|codex|copilot)   case " $c " in *' -p '*|*' --print '*|*' --prompt '*|*' exec '*) return 1;; esac; return 0;;
+    bash|sh|zsh|fish|dash|ash|node|python|python3|irb) case " $c " in *' -c '*|*' -e '*) return 1;; esac; return 0;;
+  esac
+  return 1; }
 # Open a FRESH session (ab-<box>-<folder>-<rand>) running box <name> here (survives ssh drop / app switch).
 # Always new — each launch gets its own; a random suffix keeps same-folder launches distinct. Reattach with 'ab session'.
 # A `host-*` name opens a plain HOST shell (no box, no proot) — still an ab-* session so it lists/kills/wakelocks the same.
@@ -1040,7 +1079,7 @@ sessrun(){ local prof="$1"; shift; local s base
   case "$prof" in
     host-*) [ "$#" -gt 0 ] && tmux new -s "$s" -c "$PWD" "${SHELL:-bash}" -lc "$*" \
                            || tmux new -s "$s" -c "$PWD";;       # no cmd → the default interactive host shell
-    *)      tmux new -s "$s" -c "$PWD" bash "$SELF" "$prof" "$@";;
+    *)      tmux new -s "$s" -c "$PWD" bash "$SELF" run "$prof" "$@";;   # 'run' explicitly: a box named like a command (ps, stop…) must not dispatch as one inside the pane
   esac
   anysession || { [ "$(wakestat)" = on ] && wakeoff; }; return 0; }
 session(){ local k n; case "${1:-}" in
@@ -1301,14 +1340,17 @@ update(){ { has curl || has wget; } || { msg "need curl or wget to update" "$R";
 # a narrow phone screen so descriptions get a clean hang-indent instead of wrapping to column 0.
 row(){ local n c1="$BD"; case "$1" in '<'*|'['*) c1="$Y";; esac   # a <placeholder>/[arg] name isn't a literal command → yellow
   if [ "${WIDE:-1}" = 1 ]; then n=$((30-$(dw "$1${2:+ $2}"))); ((n<1)) && n=1
-    printf '  %s%s%s%s%*s%s\n' "$c1" "$1" "${2:+ $Y$2}" "$Z" "$n" '' "$3"
-  elif [ -z "$1$2" ]; then printf '      %s\n' "$3"      # continuation line (empty command)
-  else printf '  %s%s%s%s\n      %s\n' "$c1" "$1" "${2:+ $Y$2}" "$Z" "$3"; fi; }
+    printf '  %s%s%s%s%*s%s\n' "$c1" "$1" "${2:+ $Y$2}" "$Z" "$n" '' "$(wrap 32 "$3")"
+  elif [ -z "$1$2" ]; then printf '      %s\n' "$(wrap 6 "$3")"   # continuation line (empty command)
+  else printf '  %s%s%s%s\n      %s\n' "$c1" "$1" "${2:+ $Y$2}" "$Z" "$(wrap 6 "$3")"; fi; }
 hd(){ printf '\n%s%s%s' "$CY$BD" "$1" "$Z"
-  [ -n "${2:-}" ] && { [ "${WIDE:-1}" = 1 ] && printf '  %s%s%s' "$DM" "$2" "$Z" || printf '\n  %s%s%s' "$DM" "$2" "$Z"; }
+  [ -n "${2:-}" ] && { [ "${WIDE:-1}" = 1 ] && printf '  %s%s%s' "$DM" "$(wrap $(( $(dw "$1") + 4 )) "$2")" "$Z" \
+                                            || printf '\n  %s%s%s' "$DM" "$(wrap 2 "$2")" "$Z"; }
   printf '\n'; }
-# Note bullet (▍Notes): dim "· label  text", label padded so the text column lines up.
-nt(){ printf '  %s· %-8s %s%s\n' "$DM" "$1" "$2" "$Z"; }
+# Note bullet (▍Notes): dim "· label  text", label padded so the text column lines up. These run long by design —
+# each is a whole rule — so the text is wrapped under its own column (narrow screens put it below the label).
+nt(){ if [ "${WIDE:-1}" = 1 ]; then printf '  %s· %-8s %s%s\n' "$DM" "$1" "$(wrap 13 "$2")" "$Z"
+  else printf '  %s· %s\n    %s%s\n' "$DM" "$1" "$(wrap 4 "$2")" "$Z"; fi; }
 usage(){
   local WIDE=1 cols withstatus="${1:-}"; cols=$(tput cols 2>/dev/null || echo "${COLUMNS:-80}"); [ "$cols" -ge 1 ] 2>/dev/null || cols=80
   [ "$cols" -lt 72 ] && WIDE=0
@@ -1324,7 +1366,9 @@ usage(){
   hd "▍Boxes"
   row run     "<name> [cmd]" "build+run a box scoped to this folder — runs cmd (else RUN); builds if missing"
   row "<name>" "[cmd]"    "  shorthand for 'ab run <name>' (any name that isn't a reserved command below)"
-  row "" ""               "  no cmd → a fresh tmux session each launch (survives ssh-drop; reattach: ab session)"
+  row "" ""               "  cmd replaces the profile's RUN — 'ab <name> bash' = a shell in the box, agent installed"
+  row "" ""               "  a cmd that starts with a flag ADDS to RUN instead — 'ab claude --continue' (not 'claude claude --continue')"
+  row "" ""               "  no cmd, or a cmd you sit in → a fresh tmux session (survives ssh-drop; see ▍Sessions)"
   row save    "<name>"    "golden snapshot of that box's rootfs"
   row restore "<name>"    "restore that box from its snapshot"
   row remove  "<name>"    "delete the box rootfs + snapshot (alias: rm; also asks about the profile conf)"
@@ -1334,7 +1378,7 @@ usage(){
   row ps      "[kill]"    "what agentbox is running NOW — CPU per box + battery verdict; kill clears strays"
   row "pw <name>" "[password]" "set/show a desktop box's login password (else it's random each launch)"
   row "pkg <name>" "[add|rm|search]" "search the box's apt catalog — then offers to add + 'ab upgrade' it; add/rm edit PKGS"
-  hd "▍Sessions" "(interactive 'ab <name>' opens a fresh one each launch; auto wakelock)"
+  hd "▍Sessions" "(interactive 'ab <name>' / 'ab <name> bash' opens a fresh one each launch; auto wakelock)"
   row session "[name]"    "no arg = list EVERY tmux session to reattach/kill"
   row "" ""               "  name = open a new session here (host-* → a host shell, not a box)"
   row "session kill" "[name]" "kill a session (no name = pick; wakelock frees when all end)"
@@ -1353,8 +1397,11 @@ usage(){
     row "$(printf '%-7s' "$(basename "$tf" .conf)")" "v$(tplver "$tf")" "$(tpldesc "$tf")"
   done
   hd "▍Notes"
-  nt profile  "$(short "$VC")/profile/<name>.conf — AGENT·PKGS·TOKENS·RUN·MOUNT·EPHEMERAL·DESKTOP·APP·MITM·LAN·RFB·GPU·DIST  (docker: set INSTALL='…')"
+  nt profile  "$(short "$VC")/profile/<name>.conf — AGENT · PKGS · TOKENS · RUN · MOUNT · EPHEMERAL · DESKTOP · APP · MITM · LAN · RFB · GPU · DIST  (docker: set INSTALL='…')"   # spaced so it wraps: one long unbreakable token overflows a phone screen
   nt new      "a name with no profile yet asks before creating the box — Enter = yes, n = cancel (AB_YES=1 skips the ask)"
+  nt shell    "'ab <name> bash' opens a shell in the box instead of its RUN — the agent is installed, just not started (there is no separate 'shell box' template; this is it)"
+  nt flags    "'ab <name> --flag …' adds the flags to RUN instead of replacing it: 'ab claude --continue' runs 'claude --continue' in the box"
+  nt session  "a session is opened for RUN (flags or not) and for a cmd you sit in — a shell, an agent, a REPL; anything else runs in the foreground so its output survives the pane, as does a one-shot form of those ('claude -p …', 'bash -c …'). AB_SESSION=1 forces one, AB_NO_SESSION=1 never"
   nt desktop  "DESKTOP=xfce (minimal session + wm) or kde (full KDE Plasma — fancy, ~2 GB build); both serve the same KasmVNC desktop on $GUI_BOXWEB"
   nt gpu      "GPU=virgl (desktop boxes) renders GL on the phone's GPU via a Termux-side server — opt-in, CPU if unavailable"
   nt rfb      "RFB=1 (desktop boxes) also serves the SAME desktop as plain VNC on $GUI_BOXRFB — for a native viewer with a trackpad mode (AVNC · bVNC); the browser client is touch-absolute"
