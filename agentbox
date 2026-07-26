@@ -1,6 +1,6 @@
 #!/data/data/com.termux/files/usr/bin/bash
 # Version — single source of truth; the installer greps ^VERSION= (keep the line bare, no trailing comment).
-VERSION=3.21.1
+VERSION=3.22.0
 # agentbox — throwaway, folder-scoped AI-agent boxes for a phone (Android Termux + proot-distro ONLY).
 #
 # THREAT MODEL: this protects YOUR FILES from *accidents* (an agent touching the wrong folder), not from a hostile
@@ -178,11 +178,18 @@ aboxnewok(){ local prof="$1" t="${AGENTBOX_TTY:-/dev/tty}" src="$TPL/$1.conf" a 
   printf "%sno box '%s' yet — create it from %s? [Y/n] %s" "$Y" "$prof" "$from" "$Z" > "$t"
   IFS= read -r a < "$t" || a=n
   case "$a" in [NnQq]*) msg "cancelled — nothing created" "$Y"; return 1;; esac; return 0; }
-# Kill every process whose executable lives inside a box's rootfs — daemonised Xvnc/chromium/mitmweb outlive the tmux
-# session (proot is ptrace-based, not a chroot, so /proc/<pid>/exe still resolves to the real rootfs path). Host-side.
-boxkillprocs(){ local rootfs="$1" p exe; [ -n "$rootfs" ] && [ -d "$rootfs" ] || return 0
-  for p in /proc/[0-9]*; do exe=$(readlink "$p/exe" 2>/dev/null)
-    case "$exe" in "$rootfs"/*) kill -9 "${p#/proc/}" 2>/dev/null;; esac; done; }
+# Which processes belong to a box — the one question the host can't answer with ps/pgrep. proot execs every guest
+# binary through $PREFIX/libexec/proot/loader and leaves argv untouched, so a box process shows on the host as a bare
+# `dbus-daemon` whose /proc/<pid>/exe is the LOADER: neither exe nor argv says which box, or that it's in a box at all.
+# What does say so is /proc/<pid>/maps — the guest binary and every library it loaded are mapped by their real HOST
+# path under the rootfs. (Until 3.22.0 this matched exe against the rootfs, which therefore matched nothing: every
+# daemonised desktop process survived `ab stop`. Seen in the wild as an orphaned at-spi dbus-daemon still spinning 96%
+# of a core ten hours after its desktop was closed — see `ab ps`.)
+boxpids(){ local rootfs="$1" f; [ -n "$rootfs" ] && [ -d "$rootfs" ] || return 0
+  for f in $(grep -lsm1 -F -- "$rootfs/" /proc/[0-9]*/maps 2>/dev/null); do f=${f#/proc/}; printf '%s\n' "${f%/maps}"; done; }
+psbox(){ local a; a=$(grep -som1 -E -- "$PDLIB/(containers/[^/]+/rootfs|installed-rootfs/[^/]+)/" "/proc/$1/maps") || return 1
+  a=${a#"$PDLIB"/}; a=${a#containers/}; a=${a#installed-rootfs/}; printf '%s' "${a%%/*}"; }
+boxkillprocs(){ local rootfs="$1" p; for p in $(boxpids "$rootfs"); do [ "$p" = "$$" ] || kill -9 "$p" 2>/dev/null; done; return 0; }
 aboxdrop(){ local a="$1" r; [ -n "$a" ] || return 0     # delete a built box (by alias); dir-remove as a fallback
   r=$(pdroot "$a"); [ -n "$r" ] && boxkillprocs "$r"     # kill procs running out of this rootfs, else remove/install says 'busy'
   pkill -9 -f "$a" 2>/dev/null                          # and the proot wrapper itself (its argv holds the alias)
@@ -288,6 +295,171 @@ aboxguistop(){ local prof rootfs; prof=$(cat "$STATE/boxgui.prof" 2>/dev/null)
 # which aboxguistop then deletes. To force a fresh rebuild instead, use `ab remove <name>`.
 boxstop(){ tmux has-session -t "=ab-boxgui" 2>/dev/null || { msg "no box desktop is running" "$Y"; return 0; }
   aboxguistop; msg "box desktop stopped" "$G"; }
+
+# ── `ab ps` — everything agentbox has spawned, what it costs, and how to stop it ────
+# The question this answers is "why is the phone hot / where did the battery go?", so every row carries TWO numbers:
+# LIVE is a real sample (share of ONE core over $sample seconds — what is draining right now) and CPU is the lifetime
+# total (what it has already cost). A held wakelock makes both matter with the screen off and the phone in a pocket,
+# so it leads the report.
+# STRAY is the finding this command exists for: an orphaned box process (ppid 1) in a box that nothing owns any more.
+# A desktop's own Xvnc/x11vnc/chromium/dbus ARE daemonised and sit at ppid 1 by design — legitimately, while ab-boxgui
+# lives. Once it doesn't, nothing on this phone will ever stop them again: they don't show in `ab session`, `ab stop`
+# says there's no desktop, and they hold a core until you reboot. `ab ps kill` is the one thing that clears them.
+# The judgement is per BOX, not per process (see below), so a box you are actively using is never accused.
+psdur(){ local s="${1:-0}"; case "$s" in ''|*[!0-9]*) printf '?'; return;; esac
+  [ "$s" -ge 3600 ] && { printf '%dh%02dm' $((s/3600)) $((s%3600/60)); return; }
+  [ "$s" -ge 60 ] && { printf '%dm' $((s/60)); return; }; printf '%ds' "$s"; }
+# The tmux session that owns a pid, by walking the parent chain until it hits a pane (fork-free — one read a hop).
+# Nothing found = nobody will ever stop this process: either it was daemonised on purpose, or it was orphaned.
+# /proc/<pid>/stat is parsed comm-safely everywhere here: the comm field is parenthesised and may hold spaces, so cut
+# through the LAST ')' first — after that the fields shift by 2 (state [0], ppid [1], utime [11], stime [12]).
+psown(){ local q="$1" panes="$2" i=0 s l; local -a sf
+  while [ "${q:-0}" -gt 1 ] && [ "$i" -lt 32 ]; do
+    case " $panes " in *" $q:"*) s=${panes##*" $q:"}; printf '%s' "${s%% *}"; return 0;; esac
+    read -r l 2>/dev/null < "/proc/$q/stat" || return 1
+    l=${l#*") "}; sf=($l); q=${sf[1]}; i=$((i+1))
+  done; return 1; }
+abps(){ local verb="${1:-}"; [ $# -gt 0 ] && shift
+  local t="${AGENTBOX_TTY:-/dev/tty}" sample="${AB_PS_SAMPLE:-2}" hz cores p pid box cmd own age cpu live note col lbl n now
+  local panes= nsess=0 boxmap= busy= guibox= guiprof= guiup=0 nbox=0 nstray=0 nhid=0 livetot=0 cputot=0 straycpu=0 lock virgl= a f w l w0 w1 us
+  local -a PID=() CMD=() BOX=() PP=() T0=() T1=() CLS=() rows=() KILL=() KN=() sf
+  local WIDE=1 cols; cols=$(tput cols 2>/dev/null || echo "${COLUMNS:-80}"); [ "$cols" -ge 1 ] 2>/dev/null || cols=80
+  [ "$cols" -lt 72 ] && WIDE=0                                         # same threshold as the help screen; row() reads it too
+  hz=$(getconf CLK_TCK 2>/dev/null); case "$hz" in ''|*[!0-9]*) hz=100;; esac
+  cores=$(nproc 2>/dev/null); case "$cores" in ''|*[!0-9]*) cores=1;; esac
+  case "$sample" in ''|0|*[!0-9]*) sample=2;; esac
+  nsess=$(tmux ls -F '#S' 2>/dev/null | wc -l | tr -d ' ')
+  while IFS=$'\t' read -r p a; do [ -n "$p" ] && panes="$panes $p:$a"; done \
+    < <(tmux list-panes -a -F "#{pane_pid}"$'\t'"#{session_name}" 2>/dev/null)
+  guiprof=$(cat "$STATE/boxgui.prof" 2>/dev/null)
+  tmux has-session -t "=ab-boxgui" 2>/dev/null && [ -n "$guiprof" ] && { guiup=1; guibox=$(aboxalias "$guiprof"); }
+  # One grep over every readable maps answers "is this pid in a box, and which one" for the whole phone at once.
+  for f in $(grep -lsm1 -F -- "$PDLIB/" /proc/[0-9]*/maps 2>/dev/null); do
+    pid=${f#/proc/}; pid=${pid%/maps}; a=$(psbox "$pid") || continue; boxmap="$boxmap $pid:$a"; done
+  for p in /proc/[0-9]*; do pid=${p#/proc/}; [ "$pid" = "$$" ] && continue
+    read -r l 2>/dev/null < "$p/stat" || continue; l=${l#*") "}; sf=($l)
+    cmd=; while IFS= read -r -d '' w || [ -n "$w" ]; do cmd="$cmd${cmd:+ }$w"; done 2>/dev/null < "$p/cmdline"
+    [ -n "$cmd" ] || { read -r cmd 2>/dev/null < "$p/comm" || cmd='?'; cmd="[$cmd]"; }
+    box=; case " $boxmap " in *" $pid:"*) box=${boxmap##*" $pid:"}; box=${box%% *};; esac
+    PID+=("$pid"); CMD+=("$cmd"); BOX+=("$box"); PP+=("${sf[1]}")
+  done
+  # The two tick passes are tight, fork-free and adjacent to their timestamps, and the window is MEASURED rather than
+  # assumed. Both matter: gathering argv above, or formatting rows below, inside the window would hand later processes
+  # a longer one and inflate their share (a single-threaded spinner read 121% before this was split out).
+  [ -t 1 ] && printf '%s %ssampling %ss…%s\r' "${BD}agentbox activity${Z}" "$DM" "$sample" "$Z"
+  w0=${EPOCHREALTIME:-}
+  for n in "${!PID[@]}"; do
+    if read -r l 2>/dev/null < "/proc/${PID[n]}/stat"; then l=${l#*") "}; sf=($l); T0+=("$(( ${sf[11]} + ${sf[12]} ))")
+    else T0+=(0); fi; done
+  sleep "$sample"
+  for n in "${!PID[@]}"; do
+    if read -r l 2>/dev/null < "/proc/${PID[n]}/stat"; then l=${l#*") "}; sf=($l); T1+=("$(( ${sf[11]} + ${sf[12]} ))")
+    else T1+=("${T0[n]}"); fi; done                                    # exited during the sample → no delta, still listed
+  w1=${EPOCHREALTIME:-}
+  w0=${w0/[.,]/}; w1=${w1/[.,]/}; us=0                                 # EPOCHREALTIME → µs; absent (bash 4) → the nominal window
+  case "$w0$w1" in ''|*[!0-9]*) :;; *) us=$((w1-w0));; esac; [ "$us" -gt 0 ] || us=$((sample*1000000))
+  # Ownership, then strays. A stray is judged per BOX, not per process: an orphan (ppid 1) is normal while something
+  # else in the same box is alive — a desktop daemonises Xvnc/x11vnc/chromium on purpose — and only becomes a stray
+  # when nothing owns that box any more, which is the point at which nothing left on the phone can ever stop it.
+  for n in "${!PID[@]}"; do box="${BOX[n]}"
+    if [ -z "$box" ]; then CLS+=(host); continue; fi
+    nbox=$((nbox+1)); own=$(psown "${PID[n]}" "$panes") || own=
+    if [ -n "$own" ]; then CLS+=("session ${own#ab-}")
+    elif [ "$guiup" = 1 ] && [ "$box" = "$guibox" ]; then CLS+=(desktop)
+    elif [ "${PP[n]}" = 1 ]; then CLS+=(orphan); continue                # busy-marked only by a process something still owns
+    else CLS+=(fg); fi
+    busy="$busy $box "
+  done
+  now=$(date +%s)
+  for n in "${!PID[@]}"; do pid="${PID[n]}"; box="${BOX[n]}"; cmd="${CMD[n]}"
+    live=$(( (${T1[n]} - ${T0[n]}) * 100000000 / (hz * us) )); [ "$live" -lt 0 ] && live=0
+    cpu=$(( ${T1[n]} / hz )); lbl=termux; note=; col=; own=
+    # What this process IS: argv[0]'s basename, plus the script name when that alone says nothing (bash → bash agentbox).
+    a=${cmd%% *}; a=${a##*/}
+    case "$a" in bash|sh|dash|env|python*|node|perl|ruby) w=${cmd#* }; w=${w%% *}; w=${w##*/}
+      [ -n "$w" ] && [ "$w" != "$cmd" ] && a="$a $w";; esac
+    if [ -n "$box" ]; then                                             # a process INSIDE a box (invisible to ps/pgrep)
+      lbl="${box#agentbox-}"
+      case "${CLS[n]}" in
+        session*) note="${CLS[n]}";;
+        desktop)  note="box desktop — ab stop"; col="$G";;
+        fg)       note="no session — started in the foreground";;
+        orphan) case " $busy " in *" $box "*) note="orphan of a box still in use — nothing will stop it either"; col="$Y";;
+            *) note="STRAY — its box is gone; only ab ps kill stops it"; col="$R"; nstray=$((nstray+1)); straycpu=$((straycpu+live))
+               KILL+=("$pid"); KN+=("$lbl $a");; esac;;
+      esac
+      # An active box forks constantly (the agent's own greps, gits, shells). Those are noise; an orphan never is.
+      case "${CLS[n]}" in orphan) :;; *) { [ "$live" -ge 1 ] || [ "$cpu" -ge 60 ]; } || { nhid=$((nhid+1)); continue; };; esac
+    else
+      case "$cmd" in *agentbox*|*proot*|*tmux*) own=$(psown "$pid" "$panes") || own=;; esac
+      case "$cmd" in                                                   # host side: the pieces agentbox runs in Termux
+        *"/bin/proot "*|*proot-distro*) f=; for w in $cmd; do case "$w" in *agentbox-*) f=${w##*/};; esac; done
+          lbl=host; case "$f" in agentbox-*) lbl="${f#agentbox-}";; esac
+          note="proot — this box's syscall translator${own:+ (session ${own#ab-})}";;
+        *virgl_test_server_android*) lbl=host; virgl="$pid"
+          if [ "$guiup" = 1 ]; then note="GPU=virgl server — rendering for the '$guiprof' desktop"
+          else note="GPU=virgl server — no desktop is running, still resident"; col="$Y"; fi;;
+        *agentbox*sync\ watch-run*) lbl=host; note="sync watch loop — wakes every ${cmd##* }s${own:+ (session ${own#ab-})}";;
+        tmux|tmux:*|*/tmux|tmux\ *|*/tmux\ *) lbl=host
+          case "$cmd" in *" -s "*) f=${cmd#*" -s "}; f=${f%% *}; note="tmux — the '${f#ab-}' session";;
+                         *) note="tmux server — $nsess session(s); every box hangs off it";; esac;;
+        *agentbox*|*"/bin/ab "*) lbl=host; note="agentbox${own:+ (session ${own#ab-})}"   # a wrapper shell earns a row only if it costs
+          { [ "$live" -ge 1 ] || [ "$cpu" -ge 60 ]; } || { nhid=$((nhid+1)); continue; };;
+        com.termux|com.termux:*) lbl=termux; note="the Termux app itself — everything above runs inside it";;
+        *) [ "$live" -ge 5 ] || [ "$cpu" -ge 600 ] || continue         # anything else earns a row only by costing something
+           note="not agentbox's — listed because it's busy"; col="$DM";;
+      esac; fi
+    age=$(stat -c %Y "/proc/$pid" 2>/dev/null) && age=$(( now - age )) || age=
+    livetot=$((livetot+live)); cputot=$((cputot+cpu))
+    if [ "$WIDE" = 1 ]; then                                           # phone-portrait terminals drop the age column
+      rows+=("$(printf '%08d\t%012d\t  %s%4s%%%s  %s%-9s%s %-20s %6s %6s  %s%s%s' "$live" "$cpu" \
+        "${col:-$BD}" "$live" "$Z" "$DM" "$(printf '%.9s' "$lbl")" "$Z" "$(printf '%.20s' "$a")" \
+        "$(psdur "$cpu")" "$(psdur "$age")" "${col:-$DM}" "$note" "$Z")")
+    else
+      rows+=("$(printf '%08d\t%012d\t %s%3s%%%s %s%-7s%s %-12s %5s  %s%s%s' "$live" "$cpu" \
+        "${col:-$BD}" "$live" "$Z" "$DM" "$(printf '%.7s' "$lbl")" "$Z" "$(printf '%.12s' "$a")" \
+        "$(psdur "$cpu")" "${col:-$DM}" "$note" "$Z")")
+    fi
+  done
+  lock=$(wakestat)
+  printf '%s %s\n' "${BD}agentbox activity${Z}" "${DM}$nbox box process(es) · $nsess tmux session(s) · $cores cores · ${sample}s sample${Z}"
+  hd "▍Power"
+  [ "$lock" = on ] && { anysession \
+      && st "wakelock" "ON — the phone cannot sleep while an ab- session is open (frees with the last one)" "$Y" \
+      || st "wakelock" "ON but NO session holds it — leaked; the phone has not slept since. Release: ab ps kill" "$R"; } \
+    || st "wakelock" "off — normal sleep" "$G"
+  st "right now" "$livetot% of one core ($cores available) across the rows below" "$([ "$livetot" -ge 80 ] && echo "$R" || echo "$G")"
+  st "spent" "$(psdur "$cputot") of CPU since these processes started" "$DM"
+  [ "$nstray" -gt 0 ] && st "strays" "$nstray process(es) outliving their box — $straycpu% of a core, and nothing but 'ab ps kill' will stop them" "$R" \
+    || st "strays" "none — everything running has a session or a desktop that can stop it" "$G"
+  hd "▍Processes" "live%  ·  box/host  ·  command  ·  cpu total$([ "$WIDE" = 1 ] && printf '  ·  age')$([ "$nhid" -gt 0 ] && printf ' (+%s idle process(es) not shown)' "$nhid")"
+  if [ "${#rows[@]}" -eq 0 ]; then st "nothing" "no box, no session, no helper — agentbox is idle" "$G"
+  else printf '%s\n' "${rows[@]}" | sort -t$'\t' -k1,1nr -k2,2nr | cut -f3-; fi
+  hd "▍Stop"
+  a=; [ "$nstray" -gt 0 ] && a="kill $nstray stray process(es) (~$straycpu% of a core)"
+  [ -n "$virgl" ] && [ "$guiup" != 1 ] && a="${a:+$a + }stop the idle GPU=virgl server"
+  { [ "$lock" = on ] && ! anysession; } && a="${a:+$a + }release the leaked wakelock"
+  [ -n "$a" ] && row "ab ps kill" "" "$a — boxes, sessions and desktops untouched"
+  [ "$guiup" = 1 ] && row "ab stop" "" "close the '$guiprof' box desktop (keeps the box; reopen with ab $guiprof)"
+  [ "$nsess" -gt 0 ] && row "ab session kill" "[name]" "end a session — its box exits with it, and the wakelock frees with the last one"
+  { [ -n "$a" ] || [ "$guiup" = 1 ] || [ "$nsess" -gt 0 ]; } || row "nothing to stop" "" "no strays, no desktop, no sessions — agentbox is costing nothing"
+  [ "$verb" = kill ] || return 0
+  # ── kill: strays only, never a process something living still owns ──
+  [ -n "$virgl" ] && [ "$guiup" != 1 ] && { KILL+=("$virgl"); KN+=("host virgl_test_server_android"); }
+  if [ "$#" -gt 0 ]; then local -a K2=() N2=(); for w in "$@"; do n=0                # explicit pids: only ones ab knows
+      for p in "${!KILL[@]}"; do [ "${KILL[p]}" = "$w" ] && { K2+=("$w"); N2+=("${KN[p]}"); n=1; }; done
+      [ "$n" = 1 ] || msg "pid $w is not a stray ab can account for — not killing it" "$Y"; done
+    KILL=("${K2[@]}"); KN=("${N2[@]}"); fi
+  if [ "${#KILL[@]}" -eq 0 ]; then
+    { [ "$lock" = on ] && ! anysession; } && { wakeoff; return 0; }
+    msg "nothing to clear" "$G"; return 0; fi
+  printf '\n'; for n in "${!KILL[@]}"; do msg "  kill -9 ${KILL[n]}  ${KN[n]}" "$Y"; done
+  if [ "${AB_YES:-}" != 1 ] && ( : < "$t" ) 2>/dev/null; then         # ask on the terminal, not stdin (same as box creation)
+    printf '%skill %s process(es)? [Y/n] %s' "$Y" "${#KILL[@]}" "$Z" > "$t"; IFS= read -r a < "$t" || a=
+    case "$a" in [NnQq]*) msg "cancelled — nothing killed" "$Y"; return 1;; esac; fi
+  n=0; for p in "${KILL[@]}"; do kill -9 "$p" 2>/dev/null && n=$((n+1)); done
+  msg "killed $n process(es)" "$G"
+  anysession || { [ "$(wakestat)" = on ] && wakeoff; }; return 0; }
 # `ab pw <name> [password]` — set (or show) a desktop box's login password. Stored 0600 at $VC/gui-<name>.pw; aboxgui uses
 # it instead of a fresh random one. Applies on the next launch (ab stop; ab <name>). No password arg → show the current.
 abpw(){ local prof="${1:-}" pw="${2:-}" f
@@ -525,7 +697,7 @@ abox(){ local prof="$1"; shift; local cmd="$*" cf alias rootfs \
       && msg "note: $(short "$cf") is from the $prof template v$cv; the current template is v$tv — it changed since, worth a look" "$Y"
   else aboxnewok "$prof" || return 1                            # unknown name → confirm (Enter = yes) before creating anything
     mkdir -p "$(dirname "$cf")"; aboxdefault "$cf" "$prof" || return 1
-    case " run save restore remove rm rebuild upgrade stop pw pkg setup update sync session help version ls list " in
+    case " run save restore remove rm rebuild upgrade stop ps pw pkg setup update sync session help version ls list " in
       *" $prof "*) msg "note: '$prof' is also an ab command — run this box with 'ab run $prof' ('ab $prof' triggers the command instead)" "$Y";; esac
     msg "new profile $(short "$cf") — binds only the launch folder, injects only its tokens (edit it directly)" "$Y"; fi
   # After the profile step, so a mistyped name never triggers a package install (nothing above this needs proot-distro).
@@ -1104,6 +1276,7 @@ usage(){
   row rebuild "<name>"    "force-rebuild the box from its profile — wipes + reinstalls (keeps the snapshot)"
   row upgrade "<name>"    "update a built box's apt + agent packages IN PLACE — no rebuild, no re-download"
   row stop    ""          "close the running box desktop — keeps the box (ab remove = delete + rebuild)"
+  row ps      "[kill]"    "what agentbox is running NOW — CPU per box + battery verdict; kill clears strays"
   row "pw <name>" "[password]" "set/show a desktop box's login password (else it's random each launch)"
   row "pkg <name>" "[add|rm|search]" "edit a simple profile's PKGS or search its apt catalog (rebuild to apply)"
   hd "▍Sessions" "(interactive 'ab <name>' opens a fresh one each launch; auto wakelock)"
@@ -1131,8 +1304,9 @@ usage(){
   nt gpu      "GPU=virgl (desktop boxes) renders GL on the phone's GPU via a Termux-side server — opt-in, CPU if unavailable"
   nt rfb      "RFB=1 (desktop boxes) also serves the SAME desktop as plain VNC on $GUI_BOXRFB — for a native viewer with a trackpad mode (AVNC · bVNC); the browser client is touch-absolute"
   nt tokens   "$(short "$ENVF")  (0600; only a profile's TOKENS keys are injected; AGENTBOX_* excluded)"
-  nt reserved "run save restore remove rm rebuild upgrade stop pw pkg setup update sync session help version ls list"
+  nt reserved "run save restore remove rm rebuild upgrade stop ps pw pkg setup update sync session help version ls list"
   nt shadow   "a box whose name is a reserved word runs only via 'ab run <name>' — the 'ab <name>' shorthand is taken"
+  nt battery  "a desktop's Xvnc/chromium/dbus are daemonised — end its session WITHOUT 'ab stop' and they outlive it, holding a core with the screen off; 'ab ps' finds them, 'ab ps kill' clears them"
   nt network  "shares the phone network — for a different exit IP use a whole-device Android VPN app"
   return 0
 }
@@ -1149,6 +1323,7 @@ case "${1:-}" in
   rebuild) shift; if [ -n "${1:-}" ]; then aboxbuild "$1" force; else msg "which box? ab rebuild <name>" "$Y"; fi;;
   upgrade) shift; boxupgrade "$@";;
   stop)    boxstop;;                              # close the running box desktop (keeps the box; ab remove = delete + rebuild)
+  ps)      shift; abps "$@";;                     # what agentbox has running right now, what it costs, how to stop it
   pw)      shift; abpw "$@";;                      # set/show a desktop box's login password
   pkg)     shift; abpkg "$@";;
   setup)   setup;;
