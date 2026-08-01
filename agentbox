@@ -1,6 +1,6 @@
 #!/data/data/com.termux/files/usr/bin/bash
 # Version — single source of truth; the installer greps ^VERSION= (keep the line bare, no trailing comment).
-VERSION=3.24.0
+VERSION=3.24.1
 # agentbox — throwaway, folder-scoped AI-agent boxes for a phone (Android Termux + proot-distro ONLY).
 #
 # THREAT MODEL: this protects YOUR FILES from *accidents* (an agent touching the wrong folder), not from a hostile
@@ -1229,21 +1229,21 @@ termuxprops(){ [ "${AGENTBOX_EXTRA_KEYS:-}" = none ] && return 0
 # Tuned for driving a TUI agent inside tmux from a phone. Every key that left this row is still here as a LONG-PRESS:
 #   / → ~    - → |    ↑ → PGUP    ↓ → PGDN    ← → HOME    → → END
 # Macro keys (one tap instead of a 3-tap chord through the sticky CTRL toggle):
-#   ⇧⇥  Shift+Tab   cycles Claude Code modes (normal / auto-accept / plan)
-#   ⏎↵  \ + Enter   newline WITHOUT submitting — multi-line prompts
-#   ^C  Ctrl-C      interrupt
-#   det Ctrl-b d    detach the tmux session (ab session reattaches)
-#   scr Ctrl-b [    tmux copy-mode: scroll back with the arrows (this config runs 'mouse off')
+#   ⇧⇥   Shift+Tab   cycles Claude Code modes (normal / auto-accept / plan)
+#   ⏎↵   \ + Enter   newline WITHOUT submitting — multi-line prompts
+#   ^C   Ctrl-C      interrupt
+#   hide Ctrl-b d    detach the tmux session (ab session reattaches)
+#   copy Ctrl-b [    tmux copy-mode: scroll back with the arrows (this config runs 'mouse off')
 # CTRL/ALT/ESC each appear exactly ONCE as a standalone key — Termux misbehaves when a 'special key' is listed twice.
 extra-keys = [[ \
-  ESC, TAB, {macro: "SHIFT TAB", display: "⇧⇥"}, CTRL, ALT, {key: UP, popup: PGUP}, {macro: "CTRL c", display: "^C"}, {macro: "CTRL b d", display: "det"} \
+  ESC, TAB, {macro: "SHIFT TAB", display: "⇧⇥"}, CTRL, ALT, {key: UP, popup: PGUP}, {macro: "CTRL c", display: "^C"}, {macro: "CTRL b d", display: "hide"} \
 ], [ \
-  {key: "/", popup: "~"}, {key: "-", popup: "|"}, KEYBOARD, {macro: "BACKSLASH ENTER", display: "⏎↵"}, {key: LEFT, popup: HOME}, {key: DOWN, popup: PGDN}, {key: RIGHT, popup: END}, {macro: "CTRL b [", display: "scr"} \
+  {key: "/", popup: "~"}, {key: "-", popup: "|"}, KEYBOARD, {macro: "BACKSLASH ENTER", display: "⏎↵"}, {key: LEFT, popup: HOME}, {key: DOWN, popup: PGDN}, {key: RIGHT, popup: END}, {macro: "CTRL b [", display: "copy"} \
 ]]
 EOF
   fi
   has termux-reload-settings && termux-reload-settings
-  msg "extra-keys deployed → $f  (⇧⇥ modes · ⏎↵ newline · ^C · det = detach · scr = scroll; long-press an arrow for HOME/END/PGUP/PGDN; original at $f.bak)" "$G"; }
+  msg "extra-keys deployed → $f  (⇧⇥ modes · ⏎↵ newline · ^C · hide = detach · copy = copy-mode/scroll; long-press an arrow for HOME/END/PGUP/PGDN; original at $f.bak)" "$G"; }
 # sshd: Termux is single-user and accepts any username; password auth stays on only until a key is enrolled, then key-only.
 sshauth(){ local sc="$PREFIX/etc/ssh/sshd_config" pa=yes
   grep -Eq '^[^#[:space:]]' ~/.ssh/authorized_keys 2>/dev/null && pa=no
