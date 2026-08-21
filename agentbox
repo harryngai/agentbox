@@ -1,6 +1,6 @@
 #!/data/data/com.termux/files/usr/bin/bash
 # Version — single source of truth; the installer greps ^VERSION= (keep the line bare, no trailing comment).
-VERSION=3.24.1
+VERSION=3.25.0
 # agentbox — throwaway, folder-scoped AI-agent boxes for a phone (Android Termux + proot-distro ONLY).
 #
 # THREAT MODEL: this protects YOUR FILES from *accidents* (an agent touching the wrong folder), not from a hostile
@@ -1258,7 +1258,10 @@ initphone(){ fontinstall; termuxprops; hostheal
   if [ -t 0 ]; then termux-change-repo; else msg "non-interactive — skipping termux-change-repo" "$Y"; fi
   pkg update -y || return 1
   pkg upgrade -y -o Dpkg::Options::=--force-confold || return 1
-  pkg install -y openssh termux-services iproute2 procps proot-distro || return 1
+  # termux-api = the CLI half of the phone bridge (battery · notification · clipboard · toast · share · location).
+  # The other half is the Termux:API APK, which apt cannot install — see the note printed below.
+  pkg install -y openssh termux-services iproute2 procps proot-distro termux-api || return 1
+  msg "termux-api installed (battery · notification · clipboard · toast). The CLI is only half of it: the Termux:API APP must also be installed, from the SAME source as Termux (F-Droid or Play — a mixed pair is signature-blocked), or every termux-* call fails." "$Y"
   mkdir -p ~/.ssh && chmod 700 ~/.ssh
   touch ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys
   sshauth
@@ -1302,7 +1305,7 @@ unkill(){ local t="${AGENTBOX_TTY:-/dev/tty}" pport cport code v
 setup(){ local t="${AGENTBOX_TTY:-/dev/tty}" ans i=0 tot cmd title why rest s; local -a steps
   steps=(
     "links|put agentbox on PATH|Creates the ab / agentbox commands in \$PREFIX/bin (only runs if they're missing)."
-    "init|set up Termux|Glyph font + extra-keys row (⇧⇥ · ⏎↵ · ^C · tmux detach/scroll), updates Termux, installs proot-distro, starts sshd on 8022, and self-heals the host shell after an ssh drop (no more mouse-code spill)."
+    "init|set up Termux|Glyph font + extra-keys row (⇧⇥ · ⏎↵ · ^C · tmux detach/scroll), updates Termux, installs proot-distro + termux-api (battery · notification · clipboard), starts sshd on 8022, and self-heals the host shell after an ssh drop (no more mouse-code spill)."
     "tmux|tmux config|Applies the managed tmux config (mouse off + TUI-friendly keys)."
     "unkill|stop Android killing the box|Disables the phantom-process killer via on-device adb (Android 12+, guided)."
     "env|add your API tokens|You'll be asked for each token in turn; press Enter to leave one unchanged."
